@@ -35,11 +35,11 @@ class TrainConfig:
     GEN_NOISE = 0.02          # was 0.05, less noise for cleaner synthesis
     PATIENCE = 50             # was 40
 
-    # ── NEW: augmentation strategy switches ──────────────────────────────
-    USE_POSTERIOR_GEN  = True  # Improvement 1: posterior interpolation
-    OVERSAMPLE_FACTOR  = 1.0   # generate exactly enough to balance classes
-    USE_SMOTE          = True  # Improvement 3: SMOTE on clinical features
-    USE_LATENT_CLF     = True  # Improvement 4: combine latent + clinical
+    # ── Strategy 1 only — improved posterior interpolation ───────────────
+    OVERSAMPLE_FACTOR    = 1.5   # generate 1.5× gap to provide more data
+    KNN_NEIGHBORS        = 5     # mix anchor with one of its k nearest latent neighbours
+    BETA_ALPHA           = 2.0   # Beta(α,α): α=2 concentrates near 0.5 (real mixing)
+    QUALITY_FILTER_RATIO = 2     # generate 2× needed, keep best by proximity to real
 
 
 def set_seed(seed):
@@ -199,29 +199,40 @@ def train_vae(X_raw_tr, y_tr, cfg):
 
 def generate_synthetic_posterior(vae, X_raw_tr, y_tr, raw_mean, raw_std, cfg):
     """
-    Improvement 1 — Posterior Interpolation Generation.
+    Improved Posterior Interpolation Generation (Strategy 1).
 
-    Instead of sampling z ~ N(0,I) (prior), encode real minority samples
-    to get their posterior {mu_i, sigma_i}, then generate new samples by
-    interpolating in latent space between pairs of real samples:
+    Three targeted enhancements over the naive posterior approach:
 
-        alpha ~ Uniform(0,1)
-        mu_mix   = alpha*mu_i   + (1-alpha)*mu_j
-        std_mix  = alpha*std_i  + (1-alpha)*std_j
-        z_new    = mu_mix + std_mix * eps,  eps ~ N(0,I)
+    1. KNN-guided neighbour selection
+       Encode all real samples → mu space.  For each new sample, pick an
+       anchor i at random, then pick partner j from i's k nearest neighbours
+       (not globally random).  Interpolation stays within a local,
+       geometrically consistent neighbourhood on the data manifold.
 
-    This stays close to the real data manifold, producing much more
-    realistic synthetic sequences than pure prior sampling.
+    2. Beta(α, α) mixing weight  (α = cfg.BETA_ALPHA, default 2.0)
+       alpha ~ Beta(2,2) concentrates near 0.5, so both parents always
+       contribute meaningfully.  Uniform(0,1) can produce near-copies of
+       a single sample; Beta(2,2) prevents that.
+
+    3. Quality filtering via re-encoding
+       Generate QUALITY_FILTER_RATIO × n_needed candidates, re-encode each
+       synthetic sequence through the VAE, and keep only the n_needed whose
+       latent code is closest to any real sample (1-NN distance).  This
+       discards off-manifold outliers before they enter training.
     """
+    from sklearn.neighbors import NearestNeighbors as SklearnNN
+
     device = cfg.DEVICE
     counts = Counter(y_tr.tolist())
     majority_count = max(counts.values())
 
     print(f"\n{'='*60}")
-    print(f"PHASE 2a: Posterior Interpolation Generation")
-    print(f"  Strategy: encode real → latent mixup → decode")
-    print(f"  Class counts: {dict(counts)}")
-    print(f"  Oversample factor: {cfg.OVERSAMPLE_FACTOR}")
+    print(f"PHASE 2b: Improved Posterior Interpolation (Strategy 1)")
+    print(f"  KNN neighbours : {cfg.KNN_NEIGHBORS}")
+    print(f"  Beta alpha     : {cfg.BETA_ALPHA}  (Beta({cfg.BETA_ALPHA},{cfg.BETA_ALPHA}))")
+    print(f"  Filter ratio   : {cfg.QUALITY_FILTER_RATIO}× → keep best")
+    print(f"  Oversample     : {cfg.OVERSAMPLE_FACTOR}")
+    print(f"  Class counts   : {dict(counts)}")
     print(f"{'='*60}")
 
     syn_raw_all, syn_y = [], []
@@ -233,44 +244,60 @@ def generate_synthetic_posterior(vae, X_raw_tr, y_tr, raw_mean, raw_std, cfg):
             print(f"  Class {cls}: already majority — skip")
             continue
 
-        n_needed = max(1, int(n_balance * cfg.OVERSAMPLE_FACTOR))
-        print(f"  Class {cls}: minority by {n_balance}, generating {n_needed}")
+        n_needed   = max(1, int(n_balance * cfg.OVERSAMPLE_FACTOR))
+        n_generate = n_needed * cfg.QUALITY_FILTER_RATIO
+        print(f"  Class {cls}: minority by {n_balance}, "
+              f"generating {n_generate} → keeping {n_needed}")
 
-        # Encode all real samples of this class → posterior parameters
+        # ── Step 1: encode all real samples ─────────────────────────────
         mask  = (y_tr == cls)
         X_cls = X_raw_tr[mask]
 
         mu_list, logvar_list = [], []
         for i in range(0, len(X_cls), 64):
-            batch_end = min(i + 64, len(X_cls))
-            xb = torch.FloatTensor(X_cls[i:batch_end]).to(device)
-            yb = torch.LongTensor([cls] * (batch_end - i)).to(device)
+            bend = min(i + 64, len(X_cls))
+            xb = torch.FloatTensor(X_cls[i:bend]).to(device)
+            yb = torch.LongTensor([cls] * (bend - i)).to(device)
             with torch.no_grad():
                 _, mu, logvar = vae.encode(xb, yb)
             mu_list.append(mu.cpu())
             logvar_list.append(logvar.cpu())
 
-        mu_all  = torch.cat(mu_list,    dim=0)   # (N_cls, latent_dim)
+        mu_all  = torch.cat(mu_list,   dim=0)          # (N_cls, latent_dim)
         std_all = torch.exp(0.5 * torch.cat(logvar_list, dim=0))
+        mu_np   = mu_all.numpy()
 
+        # ── Step 2: KNN in latent space ──────────────────────────────────
+        k = min(cfg.KNN_NEIGHBORS, len(mu_all) - 1)
+        nn_model = SklearnNN(n_neighbors=k + 1).fit(mu_np)
+        _, knn_idx = nn_model.kneighbors(mu_np)        # (N_cls, k+1)
+        knn_idx = knn_idx[:, 1:]                        # exclude self → (N_cls, k)
+
+        # ── Step 3: generate n_generate candidates ───────────────────────
         gen = []
-        rem = n_needed
+        rem = n_generate
         while rem > 0:
             bs = min(rem, 128)
 
-            # Pick two random real samples and interpolate
-            idx1  = torch.randint(0, len(mu_all), (bs,))
-            idx2  = torch.randint(0, len(mu_all), (bs,))
-            alpha = torch.rand(bs, 1)
+            # Anchor i random; partner j from i's KNN
+            i_arr = np.random.randint(0, len(mu_all), bs)
+            j_arr = np.array([knn_idx[i][np.random.randint(0, k)]
+                              for i in i_arr])
 
-            mu_mix  = alpha * mu_all[idx1]  + (1 - alpha) * mu_all[idx2]
-            std_mix = alpha * std_all[idx1] + (1 - alpha) * std_all[idx2]
+            # Beta(α,α) mixing weight
+            alpha = torch.tensor(
+                np.random.beta(cfg.BETA_ALPHA, cfg.BETA_ALPHA, (bs, 1)),
+                dtype=torch.float32)
 
-            # Reparameterize: sample from mixed posterior
-            z = mu_mix + std_mix * torch.randn_like(std_mix)
-            z = z.to(device)
+            i_t = torch.tensor(i_arr)
+            j_t = torch.tensor(j_arr)
+            mu_mix  = alpha * mu_all[i_t]  + (1 - alpha) * mu_all[j_t]
+            std_mix = alpha * std_all[i_t] + (1 - alpha) * std_all[j_t]
 
+            z      = mu_mix + std_mix * torch.randn_like(std_mix)
+            z      = z.to(device)
             labels = torch.full((bs,), cls, dtype=torch.long).to(device)
+
             with torch.no_grad():
                 s = vae.decode(z, labels)
                 if cfg.GEN_NOISE > 0:
@@ -279,9 +306,37 @@ def generate_synthetic_posterior(vae, X_raw_tr, y_tr, raw_mean, raw_std, cfg):
             gen.append(s.cpu().numpy())
             rem -= bs
 
-        gen = np.concatenate(gen, axis=0)[:n_needed]
-        syn_raw_all.append(gen)
-        syn_y.extend([cls] * n_needed)
+        gen_arr = np.concatenate(gen, axis=0)[:n_generate]
+
+        # ── Step 4: quality filter — keep closest to any real sample ─────
+        if cfg.QUALITY_FILTER_RATIO > 1 and len(gen_arr) > n_needed:
+            # Re-encode synthetic sequences
+            syn_mu_list = []
+            for i in range(0, len(gen_arr), 64):
+                bend = min(i + 64, len(gen_arr))
+                xb = torch.FloatTensor(gen_arr[i:bend]).to(device)
+                yb = torch.LongTensor([cls] * (bend - i)).to(device)
+                with torch.no_grad():
+                    _, mu_syn, _ = vae.encode(xb, yb)
+                syn_mu_list.append(mu_syn.cpu().numpy())
+
+            syn_mu = np.concatenate(syn_mu_list, axis=0)
+
+            # 1-NN distance to real latent codes
+            nn_filter = SklearnNN(n_neighbors=1).fit(mu_np)
+            dists, _  = nn_filter.kneighbors(syn_mu)
+            min_dists  = dists[:, 0]
+
+            keep_idx = np.argsort(min_dists)[:n_needed]
+            gen_arr  = gen_arr[keep_idx]
+            print(f"    Quality filter: "
+                  f"avg d(nearest real) kept={min_dists[keep_idx].mean():.3f} "
+                  f"vs all={min_dists.mean():.3f}")
+        else:
+            gen_arr = gen_arr[:n_needed]
+
+        syn_raw_all.append(gen_arr)
+        syn_y.extend([cls] * len(gen_arr))
 
     if not syn_raw_all:
         return np.empty((0, 300, 6)), np.empty((0, 15)), np.array([], dtype=np.int64)
@@ -289,15 +344,13 @@ def generate_synthetic_posterior(vae, X_raw_tr, y_tr, raw_mean, raw_std, cfg):
     syn_raw = np.concatenate(syn_raw_all, axis=0)
     syn_y   = np.array(syn_y, dtype=np.int64)
 
-    # Denormalize → extract 15 clinical features
     syn_denorm = syn_raw * raw_std + raw_mean
     syn_feat   = extract_features_batch(syn_denorm, dt=1.0 / 60)
 
-    print(f"  Generated: {len(syn_y)} samples | "
-          f"feat shape: {syn_feat.shape}")
-    print(f"  Distribution after augmentation: "
-          f"cls0={counts.get(0,0)+sum(syn_y==0)}, "
-          f"cls1={counts.get(1,0)+sum(syn_y==1)}")
+    print(f"  Strategy 1 generated: {len(syn_y)} samples | feat={syn_feat.shape}")
+    print(f"  Distribution: "
+          f"cls0={counts.get(0,0)+int((syn_y==0).sum())}, "
+          f"cls1={counts.get(1,0)+int((syn_y==1).sum())}")
     return syn_raw, syn_feat, syn_y
 
 
@@ -516,138 +569,78 @@ def train_classifier(X_feat_tr, y_tr, X_feat_te, y_te,
     return clf, history, float(best_f1)
 
 
-# ========================== PHASE 3: ALL VARIANTS ==========================
+# ========================== PHASE 3: TWO-VARIANT COMPARISON ================
 
-def train_all_classifiers(split, syn_raw, syn_feat, syn_y,
-                          feat_mean, feat_std, vae, cfg):
+def train_all_classifiers(split, syn_prior, syn_posterior,
+                          feat_mean, feat_std, cfg):
     """
-    Train four classifier variants and report all results:
+    Train two classifiers for a clean ablation:
 
-    1. real     — real features + class-weighted BCE  (Improvement 2)
-    2. aug      — real + VAE-posterior synthetic       (Improvement 1)
-    3. smote    — real + SMOTE synthetic               (Improvement 3)
-    4. combined — (real + VAE aug) + latent features   (Improvement 4)
+    baseline   — real data + prior sampling (z ~ N(0,I)), original approach
+    strategy1  — real data + improved posterior interpolation
+
+    Both use identical LabelSmoothingBCELoss so the only difference is the
+    augmentation source.
     """
     print(f"\n{'='*60}")
-    print(f"PHASE 3: Training All Classifier Variants")
+    print(f"PHASE 3: Baseline vs Strategy 1 Comparison")
     print(f"  Input: {split['X_feat_tr'].shape[1]} clinical features")
     print(f"{'='*60}")
 
-    device     = cfg.DEVICE
-    X_feat_tr  = split['X_feat_tr']
-    y_tr       = split['y_tr']
-    X_feat_te  = split['X_feat_te']
-    y_te       = split['y_te']
-
-    counts     = Counter(y_tr.tolist())
-    # pos_weight = count(class0) / count(class1): up-weights minority PD class
-    pos_weight = counts.get(0, 1) / max(counts.get(1, 1), 1)
-    print(f"  Train distribution: {dict(counts)} | pos_weight={pos_weight:.3f}\n")
+    X_feat_tr = split['X_feat_tr']
+    y_tr      = split['y_tr']
+    X_feat_te = split['X_feat_te']
+    y_te      = split['y_te']
 
     results = {}
 
-    # ── Variant 1: Real-only + class-weighted loss ──────────────────────
-    print(f"  [1/4] Real-only  (class-weighted BCE, N={len(y_tr)})")
-    _, h1, f1_1 = train_classifier(X_feat_tr, y_tr, X_feat_te, y_te,
-                                    'real', cfg, pos_weight=pos_weight)
-    results['real'] = (f1_1, h1)
-
-    # ── Variant 2: VAE posterior augmented ──────────────────────────────
-    if len(syn_y) > 0:
-        syn_feat_norm  = (syn_feat - feat_mean) / feat_std
-        X_aug   = np.concatenate([X_feat_tr, syn_feat_norm], axis=0)
-        y_aug   = np.concatenate([y_tr, syn_y], axis=0)
-        aug_cnt = dict(Counter(y_aug.tolist()))
-        print(f"\n  [2/4] VAE augmented  (real {len(y_tr)} + syn {len(syn_y)} = {len(y_aug)},"
-              f" dist={aug_cnt})")
-        _, h2, f1_2 = train_classifier(X_aug, y_aug, X_feat_te, y_te,
-                                        'aug', cfg, pos_weight=None)
-        results['aug'] = (f1_2, h2)
+    # ── Variant 1: Baseline — prior sampling augmentation ───────────────
+    syn_raw_p, syn_feat_p, syn_y_p = syn_prior
+    if len(syn_y_p) > 0:
+        syn_feat_p_norm = (syn_feat_p - feat_mean) / feat_std
+        X_base = np.concatenate([X_feat_tr, syn_feat_p_norm], axis=0)
+        y_base = np.concatenate([y_tr,      syn_y_p          ], axis=0)
     else:
-        print(f"\n  [2/4] No synthetic data — skipping VAE augmented")
-        results['aug'] = results['real']
+        X_base, y_base = X_feat_tr, y_tr
 
-    # ── Variant 3: SMOTE on clinical features ───────────────────────────
-    if cfg.USE_SMOTE:
-        smote_feat, smote_y = smote_on_features(X_feat_tr, y_tr)
-        smote_cnt = dict(Counter(
-            np.concatenate([y_tr, smote_y]).tolist()))
-        smote_feat_norm = (smote_feat - feat_mean) / feat_std
-        X_sm   = np.concatenate([X_feat_tr, smote_feat_norm], axis=0)
-        y_sm   = np.concatenate([y_tr, smote_y], axis=0)
-        print(f"\n  [3/4] SMOTE augmented  (real {len(y_tr)} + smote {len(smote_y)}"
-              f" = {len(y_sm)}, dist={smote_cnt})")
-        _, h3, f1_3 = train_classifier(X_sm, y_sm, X_feat_te, y_te,
-                                        'smote', cfg, pos_weight=None)
-        results['smote'] = (f1_3, h3)
+    base_cnt = dict(Counter(y_base.tolist()))
+    print(f"\n  [1/2] Baseline (prior sampling)  N={len(y_base)}  dist={base_cnt}")
+    _, h1, f1_1 = train_classifier(X_base, y_base, X_feat_te, y_te,
+                                    'baseline', cfg, pos_weight=None)
+    results['baseline'] = (f1_1, h1)
+
+    # ── Variant 2: Strategy 1 — improved posterior interpolation ────────
+    syn_raw_s1, syn_feat_s1, syn_y_s1 = syn_posterior
+    if len(syn_y_s1) > 0:
+        syn_feat_s1_norm = (syn_feat_s1 - feat_mean) / feat_std
+        X_s1 = np.concatenate([X_feat_tr, syn_feat_s1_norm], axis=0)
+        y_s1 = np.concatenate([y_tr,      syn_y_s1         ], axis=0)
     else:
-        results['smote'] = results['real']
+        X_s1, y_s1 = X_feat_tr, y_tr
 
-    # ── Variant 4: Combined clinical (15) + latent (64) features ────────
-    combined_stats = None
-    if cfg.USE_LATENT_CLF:
-        print(f"\n  [4/4] Combined: 15 clinical + 64 latent = 79 features")
-
-        z_tr = extract_latent_features(vae, split['X_raw_tr'], y_tr,  device)
-        z_te = extract_latent_features(vae, split['X_raw_te'], y_te,  device)
-
-        z_mean = z_tr.mean(axis=0)
-        z_std  = z_tr.std(axis=0);  z_std[z_std < 1e-8] = 1.0
-        z_tr_n = (z_tr - z_mean) / z_std
-        z_te_n = (z_te - z_mean) / z_std
-
-        X_comb_tr = np.concatenate([X_feat_tr, z_tr_n], axis=1)   # (N, 79)
-        X_comb_te = np.concatenate([X_feat_te, z_te_n], axis=1)
-
-        # Also include VAE synthetic samples
-        if len(syn_y) > 0:
-            z_syn        = extract_latent_features(vae, syn_raw, syn_y, device)
-            z_syn_n      = (z_syn - z_mean) / z_std
-            syn_feat_n15 = (syn_feat - feat_mean) / feat_std
-            syn_comb     = np.concatenate([syn_feat_n15, z_syn_n], axis=1)
-            X_comb_aug   = np.concatenate([X_comb_tr, syn_comb], axis=0)
-            y_comb_aug   = np.concatenate([y_tr, syn_y], axis=0)
-        else:
-            X_comb_aug = X_comb_tr
-            y_comb_aug = y_tr
-
-        comb_cnt = dict(Counter(y_comb_aug.tolist()))
-        print(f"        Feature dim: {X_comb_tr.shape[1]}  |  "
-              f"Train size: {len(y_comb_aug)}  dist={comb_cnt}")
-
-        # Apply pos_weight to combined too — raises PD recall
-        comb_counts     = Counter(y_comb_aug.tolist())
-        comb_pos_weight = comb_counts.get(0, 1) / max(comb_counts.get(1, 1), 1)
-        _, h4, f1_4 = train_classifier(X_comb_aug, y_comb_aug,
-                                        X_comb_te, y_te,
-                                        'combined', cfg,
-                                        pos_weight=comb_pos_weight)
-        results['combined'] = (f1_4, h4)
-
-        combined_stats = {
-            'z_mean':       z_mean,
-            'z_std':        z_std,
-            'combined_dim': X_comb_tr.shape[1],
-        }
-    else:
-        results['combined'] = results['real']
+    s1_cnt = dict(Counter(y_s1.tolist()))
+    print(f"\n  [2/2] Strategy 1 (improved posterior)  N={len(y_s1)}  dist={s1_cnt}")
+    _, h2, f1_2 = train_classifier(X_s1, y_s1, X_feat_te, y_te,
+                                    'strategy1', cfg, pos_weight=None)
+    results['strategy1'] = (f1_2, h2)
 
     # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"  PHASE 3 RESULTS:")
-    print(f"  {'Variant':18s}  {'Best F1':>8s}")
-    print(f"  {'-'*30}")
+    print(f"  {'Variant':22s}  {'Best F1':>8s}")
+    print(f"  {'-'*34}")
+    best_f1_val = max(v[0] for v in results.values())
     for tag, (f1, _) in sorted(results.items(), key=lambda x: -x[1][0]):
-        marker = " ← BEST" if f1 == max(v[0] for v in results.values()) else ""
-        print(f"  {tag:18s}  {f1:8.4f}{marker}")
+        marker = " ← BEST" if f1 == best_f1_val else ""
+        print(f"  {tag:22s}  {f1:8.4f}{marker}")
 
-    best_tag = max(results.items(), key=lambda x: x[1][0])[0]
-    best_f1  = results[best_tag][0]
-    print(f"  Selected best: {best_tag}  (F1={best_f1:.4f})")
+    d_f1 = results['strategy1'][0] - results['baseline'][0]
+    print(f"\n  Strategy 1 vs Baseline:  ΔF1(PD) = {d_f1:+.4f}")
     print(f"{'='*60}")
 
+    best_tag  = max(results.items(), key=lambda x: x[1][0])[0]
     clf_hists = {tag: h for tag, (_, h) in results.items()}
-    return best_tag, clf_hists, combined_stats
+    return best_tag, clf_hists
 
 
 # ========================== MAIN ===========================================
@@ -663,42 +656,44 @@ def main():
     # Phase 1: Train Conditional LSTM-VAE
     vae, vae_hist = train_vae(split['X_raw_tr'], split['y_tr'], cfg)
 
-    # Phase 2: Generate synthetic minority data
-    if cfg.USE_POSTERIOR_GEN:
-        syn_raw, syn_feat, syn_y = generate_synthetic_posterior(
-            vae, split['X_raw_tr'], split['y_tr'], raw_mean, raw_std, cfg)
-    else:
-        syn_raw, syn_feat, syn_y = generate_synthetic_prior(
-            vae, split['y_tr'], raw_mean, raw_std, cfg)
+    # Phase 2a: Baseline — prior sampling  z ~ N(0,I)
+    syn_raw_prior, syn_feat_prior, syn_y_prior = generate_synthetic_prior(
+        vae, split['y_tr'], raw_mean, raw_std, cfg)
 
-    # Phase 3: Train all classifier variants
-    best_tag, clf_hists, combined_stats = train_all_classifiers(
-        split, syn_raw, syn_feat, syn_y,
-        feat_mean, feat_std, vae, cfg)
+    # Phase 2b: Strategy 1 — improved posterior interpolation
+    syn_raw_post, syn_feat_post, syn_y_post = generate_synthetic_posterior(
+        vae, split['X_raw_tr'], split['y_tr'], raw_mean, raw_std, cfg)
 
-    # Save everything
+    # Phase 3: Baseline vs Strategy 1
+    best_tag, clf_hists = train_all_classifiers(
+        split,
+        syn_prior     = (syn_raw_prior, syn_feat_prior, syn_y_prior),
+        syn_posterior = (syn_raw_post,  syn_feat_post,  syn_y_post),
+        feat_mean=feat_mean, feat_std=feat_std, cfg=cfg)
+
+    # Save everything (use strategy1 synthetic for t-SNE visualisation)
     save_dict = {
-        'vae_history':     vae_hist,
-        'clf_histories':   clf_hists,
-        'best_model':      best_tag,
-        'raw_mean':        raw_mean,
-        'raw_std':         raw_std,
-        'feat_mean':       feat_mean,
-        'feat_std':        feat_std,
-        'vae_channel_names':   vae_names,
+        'vae_history':            vae_hist,
+        'clf_histories':          clf_hists,
+        'best_model':             best_tag,
+        'raw_mean':               raw_mean,
+        'raw_std':                raw_std,
+        'feat_mean':              feat_mean,
+        'feat_std':               feat_std,
+        'vae_channel_names':      vae_names,
         'clinical_feature_names': clin_names,
-        'X_raw_test':      split['X_raw_te'],
-        'X_feat_test':     split['X_feat_te'],
-        'y_test':          split['y_te'],
-        'X_raw_train':     split['X_raw_tr'],
-        'X_feat_train':    split['X_feat_tr'],
-        'y_train':         split['y_tr'],
-        'syn_raw':         syn_raw,
-        'syn_feat':        syn_feat,
-        'syn_y':           syn_y,
-        'file_ids_test':   split.get('fid_te'),
-        'file_ids_train':  split.get('fid_tr'),
-        'combined_stats':  combined_stats,   # z_mean, z_std, combined_dim
+        'X_raw_test':             split['X_raw_te'],
+        'X_feat_test':            split['X_feat_te'],
+        'y_test':                 split['y_te'],
+        'X_raw_train':            split['X_raw_tr'],
+        'X_feat_train':           split['X_feat_tr'],
+        'y_train':                split['y_tr'],
+        'syn_raw':                syn_raw_post,   # strategy1 for t-SNE
+        'syn_feat':               syn_feat_post,
+        'syn_y':                  syn_y_post,
+        'file_ids_test':          split.get('fid_te'),
+        'file_ids_train':         split.get('fid_tr'),
+        'combined_stats':         None,
     }
     with open(os.path.join(cfg.CKPT_DIR, 'train_results.pkl'), 'wb') as f:
         pickle.dump(save_dict, f)

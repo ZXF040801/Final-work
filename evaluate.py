@@ -1,12 +1,11 @@
 """
 =============================================================================
-evaluate.py — Comprehensive Evaluation & Visualization
+evaluate.py — Evaluation & Visualization
 =============================================================================
-Compares all four classifier variants:
-  real     : real clinical features + class-weighted BCE
-  aug      : real + VAE posterior synthetic features
-  smote    : real + SMOTE synthetic features
-  combined : real + VAE aug, using clinical (15) + latent (64) = 79 features
+Compares two classifier variants:
+  baseline  : real data + prior sampling (z ~ N(0,I)), original approach
+  strategy1 : real data + improved posterior interpolation
+                (KNN-guided mixing, Beta(2,2) weights, quality filtering)
 
 Plots: confusion_matrix, roc_curve, training_curves, tsne_latent, reconstruction
 =============================================================================
@@ -30,10 +29,8 @@ CKPT_DIR    = 'checkpoints'
 
 # Human-readable labels for each variant
 VARIANT_LABELS = {
-    'real':     'Real-only (weighted BCE)',
-    'aug':      'VAE Augmented (posterior)',
-    'smote':    'SMOTE Augmented',
-    'combined': 'Clinical+Latent (combined)',
+    'baseline':  'Baseline (prior sampling)',
+    'strategy1': 'Strategy 1 (improved posterior)',
 }
 
 
@@ -71,40 +68,25 @@ def evaluate_model(clf, X_feat_te, y_te, device):
 
 def evaluate_all_variants(res, vae, device):
     """
-    Evaluate all available classifier checkpoints.
+    Evaluate baseline and strategy1 classifier checkpoints.
     Returns a dict: tag → {preds, probs, acc, auc, f1, recall_pd, prec_pd}
     """
-    X_feat_te   = res['X_feat_test']
-    y_te        = res['y_test']
-    X_raw_te    = res['X_raw_test']
-    y_tr        = res['y_train']
-    feat_dim    = X_feat_te.shape[-1]
-    combined_st = res.get('combined_stats', None)
+    X_feat_te = res['X_feat_test']
+    y_te      = res['y_test']
+    feat_dim  = X_feat_te.shape[-1]
 
     summary = {}
 
-    for tag in ['real', 'aug', 'smote', 'combined']:
+    for tag in ['baseline', 'strategy1']:
         ckpt_path = os.path.join(CKPT_DIR, f'clf_best_{tag}.pt')
         if not os.path.exists(ckpt_path):
             continue
 
-        # Determine input dim
-        if tag == 'combined' and combined_st is not None:
-            clf_dim = combined_st['combined_dim']
-        else:
-            clf_dim = feat_dim
-
-        clf = create_classifier(clf_dim).to(device)
+        clf = create_classifier(feat_dim).to(device)
         clf.load_state_dict(torch.load(ckpt_path, map_location=device,
                                         weights_only=True))
 
-        # Build test feature matrix
-        if tag == 'combined' and combined_st is not None:
-            z_te   = extract_latent_features(vae, X_raw_te, y_te, device)
-            z_te_n = (z_te - combined_st['z_mean']) / combined_st['z_std']
-            X_te   = np.concatenate([X_feat_te, z_te_n], axis=1)
-        else:
-            X_te = X_feat_te
+        X_te = X_feat_te
 
         preds, probs = evaluate_model(clf, X_te, y_te, device)
 
@@ -195,8 +177,7 @@ def tune_threshold(summary, y_te, target_recall=0.85):
 def plot_precision_recall(summary, y_te):
     """Precision-Recall curves with optimal operating points marked."""
     from sklearn.metrics import precision_recall_curve, average_precision_score
-    colors = {'real': 'tab:blue', 'aug': 'tab:orange',
-              'smote': 'tab:green', 'combined': 'tab:red'}
+    colors = {'baseline': 'tab:blue', 'strategy1': 'tab:orange'}
 
     fig, ax = plt.subplots(figsize=(8, 6))
     for tag, m in summary.items():
@@ -249,22 +230,20 @@ def print_full_comparison(summary, y_te):
         print(f"  {label:28s}{m['acc']:7.3f}{m['auc']:7.3f}"
               f"{m['f1_pd']:9.3f}{m['recall_pd']:9.3f}{marker}")
 
-    # ── Show improvement vs real-only ───────────────────────────────────
-    if 'real' in summary:
-        base = summary['real']
-        print(f"\n  Improvement over Real-only:")
+    # ── Show improvement of Strategy 1 over Baseline ────────────────────
+    if 'baseline' in summary and 'strategy1' in summary:
+        base = summary['baseline']
+        m    = summary['strategy1']
+        label = VARIANT_LABELS.get('strategy1', 'strategy1')[:28]
+        d_acc = m['acc']       - base['acc']
+        d_auc = m['auc']       - base['auc']
+        d_f1  = m['f1_pd']     - base['f1_pd']
+        d_rec = m['recall_pd'] - base['recall_pd']
+        print(f"\n  Improvement of Strategy 1 over Baseline:")
         print(f"  {'-'*60}")
-        for tag, m in summary.items():
-            if tag == 'real':
-                continue
-            label = VARIANT_LABELS.get(tag, tag)[:28]
-            d_acc    = m['acc']       - base['acc']
-            d_auc    = m['auc']       - base['auc']
-            d_f1     = m['f1_pd']     - base['f1_pd']
-            d_rec    = m['recall_pd'] - base['recall_pd']
-            print(f"  {label:28s}"
-                  f"  Δacc={d_acc:+.3f}  Δauc={d_auc:+.3f}"
-                  f"  ΔF1(PD)={d_f1:+.3f}  ΔRec(PD)={d_rec:+.3f}")
+        print(f"  {label:28s}"
+              f"  Δacc={d_acc:+.3f}  Δauc={d_auc:+.3f}"
+              f"  ΔF1(PD)={d_f1:+.3f}  ΔRec(PD)={d_rec:+.3f}")
 
 
 # ========================== PLOTS ==========================================
@@ -278,7 +257,7 @@ def plot_confusion_all(y_te, summary):
         axes = [axes]
     fig.suptitle('Confusion Matrices — All Variants', fontsize=14)
 
-    cmaps = ['Blues', 'Oranges', 'Greens', 'Purples']
+    cmaps = ['Blues', 'Oranges', 'Greens', 'Purples'][:n]
     for ax, tag, cmap in zip(axes, tags, cmaps):
         cm = confusion_matrix(y_te, summary[tag]['preds'])
         ConfusionMatrixDisplay(cm, display_labels=['Non-PD (0)', 'PD (1)']).plot(
@@ -296,8 +275,7 @@ def plot_confusion_all(y_te, summary):
 
 def plot_roc_all(y_te, summary):
     """ROC curves for all variants."""
-    colors = {'real': 'tab:blue', 'aug': 'tab:orange',
-              'smote': 'tab:green', 'combined': 'tab:red'}
+    colors = {'baseline': 'tab:blue', 'strategy1': 'tab:orange'}
     fig, ax = plt.subplots(figsize=(7, 6))
 
     for tag, m in summary.items():
@@ -318,11 +296,11 @@ def plot_roc_all(y_te, summary):
 
 def plot_training_curves(vae_hist, clf_hists, best_tag):
     """Training history plots."""
-    tags   = [t for t in ['real', 'aug', 'smote', 'combined'] if t in clf_hists]
-    n_tags = len(tags)
+    tags       = [t for t in ['baseline', 'strategy1'] if t in clf_hists]
+    colors_clf = {'baseline': 'tab:blue', 'strategy1': 'tab:orange'}
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle('Training History', fontsize=16)
+    fig.suptitle('Training History — Baseline vs Strategy 1', fontsize=16)
 
     # VAE curves
     axes[0, 0].plot(vae_hist['recon'], 'g-'); axes[0, 0].set_title('VAE Recon Loss')
@@ -332,8 +310,6 @@ def plot_training_curves(vae_hist, clf_hists, best_tag):
     axes[0, 2].plot(vae_hist['total'], 'b-'); axes[0, 2].set_title('VAE Total Loss')
 
     # Classifier curves
-    colors_clf = {'real': 'tab:blue', 'aug': 'tab:orange',
-                  'smote': 'tab:green', 'combined': 'tab:red'}
     for tag in tags:
         h   = clf_hists[tag]
         lbl = VARIANT_LABELS.get(tag, tag)
@@ -343,7 +319,7 @@ def plot_training_curves(vae_hist, clf_hists, best_tag):
         axes[1, 1].plot(h['val_acc'],    color=c, label=lbl)
         axes[1, 2].plot(h['val_f1'],     color=c, label=lbl)
 
-    axes[1, 0].set_title('Classifier Loss'); axes[1, 0].legend(fontsize=6)
+    axes[1, 0].set_title('Classifier Loss'); axes[1, 0].legend(fontsize=7)
     axes[1, 1].set_title('Val Accuracy');    axes[1, 1].legend(fontsize=7)
     axes[1, 2].set_title(f'Val F1  (best: {best_tag})'); axes[1, 2].legend(fontsize=7)
 
@@ -386,7 +362,7 @@ def plot_tsne(vae, X_raw_tr, y_tr, syn_raw, syn_y, device):
                  max_iter=1000).fit_transform(z_all)
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(16, 7))
-    fig.suptitle('VAE Latent Space (t-SNE)  —  Posterior Interpolation', fontsize=14)
+    fig.suptitle('VAE Latent Space (t-SNE)  —  Strategy 1 Synthetic Samples', fontsize=14)
 
     for cls, c, lb in [(0, 'tab:blue', 'Non-PD'), (1, 'tab:red', 'PD')]:
         m = y_tr == cls
@@ -484,7 +460,7 @@ def main():
     print(f"  Test samples : {len(res['y_test'])} "
           f"(0={np.sum(res['y_test']==0)}, 1={np.sum(res['y_test']==1)})")
     print(f"  VAE input    : {input_dim}-channel × {seq_len} timesteps")
-    print(f"  Classifier   : {feat_dim} clinical features (+ 64 latent for combined)")
+    print(f"  Classifier   : {feat_dim} clinical features")
 
     # Load VAE
     vae = create_vae(input_dim, seq_len).to(device)
