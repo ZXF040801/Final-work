@@ -615,9 +615,13 @@ def train_all_classifiers(split, syn_raw, syn_feat, syn_y,
         print(f"        Feature dim: {X_comb_tr.shape[1]}  |  "
               f"Train size: {len(y_comb_aug)}  dist={comb_cnt}")
 
+        # Apply pos_weight to combined too — raises PD recall
+        comb_counts     = Counter(y_comb_aug.tolist())
+        comb_pos_weight = comb_counts.get(0, 1) / max(comb_counts.get(1, 1), 1)
         _, h4, f1_4 = train_classifier(X_comb_aug, y_comb_aug,
                                         X_comb_te, y_te,
-                                        'combined', cfg, pos_weight=None)
+                                        'combined', cfg,
+                                        pos_weight=comb_pos_weight)
         results['combined'] = (f1_4, h4)
 
         combined_stats = {

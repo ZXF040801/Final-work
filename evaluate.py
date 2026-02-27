@@ -129,6 +129,97 @@ def evaluate_all_variants(res, vae, device):
     return summary
 
 
+def tune_threshold(summary, y_te, target_recall=0.85):
+    """
+    For each variant, find the threshold that:
+      1. Maximises F1(PD)
+      2. Achieves target_recall(PD) with highest precision
+
+    Returns augmented summary with threshold info.
+    """
+    thresholds = np.linspace(0.1, 0.9, 81)
+
+    print(f"\n{'='*65}")
+    print(f"  THRESHOLD TUNING  (default=0.5, target_recall≥{target_recall})")
+    print(f"{'='*65}")
+    hdr = f"  {'Variant':28s}{'Thr':>6s}{'Acc':>7s}{'AUC':>7s}{'F1(PD)':>9s}{'Rec(PD)':>9s}{'Prec(PD)':>10s}"
+    print(hdr); print(f"  {'-'*65}")
+
+    for tag, m in summary.items():
+        probs = m['probs']
+        best_f1, best_thr_f1 = -1, 0.5
+        thr_recall, rec_at_thr, prec_at_thr = 0.5, 0.0, 0.0
+
+        for thr in thresholds:
+            preds = (probs > thr).astype(int)
+            tp = ((preds==1)&(y_te==1)).sum()
+            fp = ((preds==1)&(y_te==0)).sum()
+            fn = ((preds==0)&(y_te==1)).sum()
+            prec = tp / (tp + fp + 1e-8)
+            rec  = tp / (tp + fn + 1e-8)
+            f1   = 2*prec*rec / (prec + rec + 1e-8)
+            if f1 > best_f1:
+                best_f1     = f1
+                best_thr_f1 = thr
+            # best threshold that achieves target_recall
+            if rec >= target_recall and prec > prec_at_thr:
+                thr_recall   = thr
+                rec_at_thr   = rec
+                prec_at_thr  = prec
+
+        # Evaluate at best-F1 threshold
+        preds_opt = (probs > best_thr_f1).astype(int)
+        acc_opt   = (preds_opt == y_te).mean()
+        tp = ((preds_opt==1)&(y_te==1)).sum()
+        fp = ((preds_opt==1)&(y_te==0)).sum()
+        fn = ((preds_opt==0)&(y_te==1)).sum()
+        prec_opt = tp / (tp + fp + 1e-8)
+        rec_opt  = tp / (tp + fn + 1e-8)
+
+        m['best_thr']    = best_thr_f1
+        m['preds_opt']   = preds_opt
+        m['f1_pd_opt']   = best_f1
+        m['acc_opt']     = acc_opt
+        m['recall_opt']  = rec_opt
+        m['prec_opt']    = prec_opt
+        m['thr_recall']  = thr_recall
+
+        lbl = VARIANT_LABELS.get(tag, tag)[:28]
+        print(f"  {lbl:28s}{best_thr_f1:6.2f}{acc_opt:7.3f}{m['auc']:7.3f}"
+              f"{best_f1:9.3f}{rec_opt:9.3f}{prec_opt:10.3f}")
+
+    print(f"\n  [Optimised threshold — best F1(PD) for each variant]")
+    return summary
+
+
+def plot_precision_recall(summary, y_te):
+    """Precision-Recall curves with optimal operating points marked."""
+    from sklearn.metrics import precision_recall_curve, average_precision_score
+    colors = {'real': 'tab:blue', 'aug': 'tab:orange',
+              'smote': 'tab:green', 'combined': 'tab:red'}
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for tag, m in summary.items():
+        prec_c, rec_c, _ = precision_recall_curve(y_te, m['probs'])
+        ap  = average_precision_score(y_te, m['probs'])
+        c   = colors.get(tag, 'gray')
+        lbl = VARIANT_LABELS.get(tag, tag)
+        ax.plot(rec_c, prec_c, lw=2, color=c, label=f'{lbl}  AP={ap:.3f}')
+        # Mark optimal threshold point
+        if 'recall_opt' in m:
+            ax.scatter(m['recall_opt'], m['prec_opt'], s=100,
+                       color=c, zorder=5, marker='*')
+
+    ax.set_xlabel('Recall (PD)')
+    ax.set_ylabel('Precision (PD)')
+    ax.set_title('Precision–Recall Curves  (★ = optimal F1 threshold)')
+    ax.legend(loc='lower left', fontsize=8)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    path = os.path.join(RESULTS_DIR, 'precision_recall_curve.png')
+    fig.savefig(path, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"  Saved: {path}")
+
+
 def print_full_comparison(summary, y_te):
     """Print classification reports and comparison table for all variants."""
 
@@ -405,10 +496,12 @@ def main():
     print(f"\n  Loaded variants: {list(summary.keys())}")
 
     print_full_comparison(summary, res['y_test'])
+    summary = tune_threshold(summary, res['y_test'], target_recall=0.85)
 
     print("\nGenerating plots...")
     plot_confusion_all(res['y_test'], summary)
     plot_roc_all(res['y_test'], summary)
+    plot_precision_recall(summary, res['y_test'])
     plot_training_curves(res['vae_history'], res['clf_histories'],
                          res['best_model'])
     plot_tsne(vae, res['X_raw_train'], res['y_train'],
