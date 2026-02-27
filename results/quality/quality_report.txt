@@ -1,0 +1,44 @@
+========================================================================
+DATA QUALITY REPORT
+========================================================================
+Total files scanned : 155  (class 0: 100, class 1: 55)
+Clean files         : 152
+Files with problems : 3
+
+Problem summary:
+  P5: 3 file(s)
+
+------------------------------------------------------------------------
+FILES WITH PROBLEMS:
+------------------------------------------------------------------------
+
+  [CLASS 1]  PD-Ruijin_310226194901232614_tappingright1_2020-09-02_12-10-11.txt
+    duration=21.0s  windows=13  dist_range=3.91cm  tap_rate_mean=0.94Hz  zero_tap_wins=1
+    >>> P5-outlier (1/13 windows, features: ['dist_iti_mean'])
+
+  [CLASS 1]  PD-Ruijin_342101197310257818_tappingleft1_2020-10-21_14-59-25.txt
+    duration=13.5s  windows=7  dist_range=4.70cm  tap_rate_mean=1.51Hz  zero_tap_wins=0
+    >>> P5-outlier (1/7 windows, features: ['dist_iti_mean', 'dist_tap_jitter'])
+
+  [CLASS 1]  PD-Ruijin_342622196402246723_tappingright1_2020-08-31_15-12-35.txt
+    duration=25.1s  windows=17  dist_range=3.93cm  tap_rate_mean=0.98Hz  zero_tap_wins=0
+    >>> P5-outlier (1/17 windows, features: ['dist_iti_mean'])
+
+========================================================================
+RECOMMENDED REMOVALS (severe problems only):
+  Criteria: P0, P1-FAILED, P2, P3, P4, P6, P7
+========================================================================
+
+From class 0 (0 files):
+
+From class 1 (0 files):
+
+========================================================================
+BORDERLINE (P1-POOR or P5 outliers only — review manually):
+========================================================================
+  [CLASS 1] PD-Ruijin_310226194901232614_tappingright1_2020-09-02_12-10-11.txt
+    > P5-outlier (1/13 windows, features: ['dist_iti_mean'])
+  [CLASS 1] PD-Ruijin_342101197310257818_tappingleft1_2020-10-21_14-59-25.txt
+    > P5-outlier (1/7 windows, features: ['dist_iti_mean', 'dist_tap_jitter'])
+  [CLASS 1] PD-Ruijin_342622196402246723_tappingright1_2020-08-31_15-12-35.txt
+    > P5-outlier (1/17 windows, features: ['dist_iti_mean'])
