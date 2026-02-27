@@ -160,8 +160,10 @@ def train_vae(X_raw_tr, y_tr, cfg):
         # Save best model (based on recon loss)
         if avg_recon < best_recon:
             best_recon = avg_recon
-            torch.save(vae.state_dict(),
-                       os.path.join(cfg.CKPT_DIR, 'vae_best.pt'))
+            ckpt_path = os.path.join(cfg.CKPT_DIR, 'vae_best.pt')
+            if os.path.exists(ckpt_path):
+                os.remove(ckpt_path)
+            torch.save(vae.state_dict(), ckpt_path)
 
     vae.load_state_dict(torch.load(os.path.join(cfg.CKPT_DIR, 'vae_best.pt'),
                                     map_location=device, weights_only=True))
@@ -320,27 +322,19 @@ def train_classifier(X_feat_tr, y_tr, X_feat_te, y_te, tag, cfg):
 def train_classifiers(X_feat_tr, y_tr, X_feat_te, y_te,
                       syn_feat, syn_y, feat_mean, feat_std, cfg):
     print(f"\n{'='*60}")
-    print(f"PHASE 3: Training Classifiers on 15 Clinical Features")
+    print(f"PHASE 3: Training Classifier on Real + Synthetic Features")
     print(f"  Real: {len(y_tr)}, Synthetic: {len(syn_y)}")
     print(f"{'='*60}")
 
-    print("\n  --- Real-only ---")
-    clf_real, hist_real, f1_real = train_classifier(
-        X_feat_tr, y_tr, X_feat_te, y_te, 'real', cfg)
+    syn_feat_norm = (syn_feat - feat_mean) / feat_std
+    X_aug = np.concatenate([X_feat_tr, syn_feat_norm], axis=0)
+    y_aug = np.concatenate([y_tr, syn_y], axis=0)
+    print(f"\n  --- Augmented (real+syn={len(y_aug)}) ---")
+    clf_aug, hist_aug, f1_aug = train_classifier(
+        X_aug, y_aug, X_feat_te, y_te, 'aug', cfg)
 
-    if len(syn_y) > 0:
-        syn_feat_norm = (syn_feat - feat_mean) / feat_std
-        X_aug = np.concatenate([X_feat_tr, syn_feat_norm], axis=0)
-        y_aug = np.concatenate([y_tr, syn_y], axis=0)
-        print(f"\n  --- Augmented (real+syn={len(y_aug)}) ---")
-        clf_aug, hist_aug, f1_aug = train_classifier(
-            X_aug, y_aug, X_feat_te, y_te, 'aug', cfg)
-    else:
-        hist_aug, f1_aug = hist_real, f1_real
-
-    best_tag = 'aug' if f1_aug > f1_real else 'real'
-    print(f"\n  Selected: {best_tag} (F1={max(f1_real, f1_aug):.3f})")
-    return best_tag, {'real': hist_real, 'aug': hist_aug}
+    print(f"\n  Final F1 (After VAE): {f1_aug:.3f}")
+    return {'aug': hist_aug}
 
 
 # ========================== MAIN ===========================================
@@ -356,14 +350,14 @@ def main():
     vae, vae_hist = train_vae(split['X_raw_tr'], split['y_tr'], cfg)
     syn_raw, syn_feat, syn_y = generate_synthetic(
         vae, split['y_tr'], raw_mean, raw_std, cfg)
-    best_tag, clf_hists = train_classifiers(
+    clf_hists = train_classifiers(
         split['X_feat_tr'], split['y_tr'],
         split['X_feat_te'], split['y_te'],
         syn_feat, syn_y, feat_mean, feat_std, cfg)
 
     save_dict = {
         'vae_history': vae_hist, 'clf_histories': clf_hists,
-        'best_model': best_tag,
+        'best_model': 'aug',
         'raw_mean': raw_mean, 'raw_std': raw_std,
         'feat_mean': feat_mean, 'feat_std': feat_std,
         'vae_channel_names': vae_names,
@@ -379,7 +373,7 @@ def main():
     with open(os.path.join(cfg.CKPT_DIR, 'train_results.pkl'), 'wb') as f:
         pickle.dump(save_dict, f)
 
-    print(f"\n{'='*60}\nTRAINING COMPLETE — best: {best_tag}\n{'='*60}")
+    print(f"\n{'='*60}\nTRAINING COMPLETE\n{'='*60}")
 
 
 if __name__ == "__main__":

@@ -1,12 +1,3 @@
-"""
-=============================================================================
-evaluate.py — Evaluation & Visualization
-=============================================================================
-Before VAE (real-only) vs After VAE (real+synthetic) comparison.
-Plots: confusion_matrix, roc_curve, training_curves, tsne_latent, reconstruction
-=============================================================================
-"""
-
 import os, pickle
 import numpy as np
 import torch
@@ -40,100 +31,61 @@ def evaluate_model(clf, X_feat_te, y_te, device):
     return preds, probs
 
 
-def print_comparison(X_feat_te, y_te, feat_dim, device):
-    clf_real = create_classifier(feat_dim).to(device)
-    clf_real.load_state_dict(torch.load(
-        os.path.join(CKPT_DIR, 'clf_best_real.pt'),
+def print_results(X_feat_te, y_te, feat_dim, device):
+    clf_aug = create_classifier(feat_dim).to(device)
+    clf_aug.load_state_dict(torch.load(
+        os.path.join(CKPT_DIR, 'clf_best_aug.pt'),
         map_location=device, weights_only=True))
 
-    clf_aug = create_classifier(feat_dim).to(device)
-    aug_path = os.path.join(CKPT_DIR, 'clf_best_aug.pt')
-    has_aug = os.path.exists(aug_path)
-    if has_aug:
-        clf_aug.load_state_dict(torch.load(
-            aug_path, map_location=device, weights_only=True))
+    preds_aug, probs_aug = evaluate_model(clf_aug, X_feat_te, y_te, device)
 
-    preds_real, probs_real = evaluate_model(clf_real, X_feat_te, y_te, device)
+    fpr, tpr, _ = roc_curve(y_te, probs_aug)
+    auc_score = auc(fpr, tpr)
+    acc = (preds_aug == y_te).mean()
 
     print("\n" + "=" * 60)
-    print("BEFORE VAE (Real Data Only)")
+    print("AFTER VAE (Real + Synthetic Data)")
     print("=" * 60)
-    print(classification_report(y_te, preds_real,
+    print(classification_report(y_te, preds_aug,
           target_names=['Non-PD (0)', 'PD (1)'], digits=3))
-    fpr_r, tpr_r, _ = roc_curve(y_te, probs_real)
-    auc_real = auc(fpr_r, tpr_r)
-    print(f"  AUC: {auc_real:.3f}")
-
-    if has_aug:
-        preds_aug, probs_aug = evaluate_model(clf_aug, X_feat_te, y_te, device)
-        print("\n" + "=" * 60)
-        print("AFTER VAE (Real + Synthetic Data)")
-        print("=" * 60)
-        print(classification_report(y_te, preds_aug,
-              target_names=['Non-PD (0)', 'PD (1)'], digits=3))
-        fpr_a, tpr_a, _ = roc_curve(y_te, probs_aug)
-        auc_aug = auc(fpr_a, tpr_a)
-        print(f"  AUC: {auc_aug:.3f}")
-    else:
-        preds_aug, probs_aug = preds_real, probs_real
-        auc_aug = auc_real
-        print("\n  [No augmented model found — skipping After VAE]")
-
-    acc_r = (preds_real == y_te).mean()
-    acc_a = (preds_aug == y_te).mean()
-
-    print("\n" + "=" * 60)
-    print("SUMMARY")
+    print(f"  AUC:      {auc_score:.3f}")
+    print(f"  Accuracy: {acc:.3f}")
     print("=" * 60)
-    print(f"  {'':20s} {'Before VAE':>12s}  {'After VAE':>12s}  {'Change':>10s}")
-    print(f"  {'Accuracy':20s} {acc_r:>12.3f}  {acc_a:>12.3f}  {acc_a-acc_r:>+10.3f}")
-    print(f"  {'AUC':20s} {auc_real:>12.3f}  {auc_aug:>12.3f}  {auc_aug-auc_real:>+10.3f}")
 
-    return preds_real, probs_real, preds_aug, probs_aug
+    return preds_aug, probs_aug
 
 
 # ========================== PLOTS ==========================================
 
-def plot_confusion(y_te, preds_real, preds_aug):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle('Confusion Matrix', fontsize=14)
-
-    cm_r = confusion_matrix(y_te, preds_real)
-    ConfusionMatrixDisplay(cm_r, display_labels=['Non-PD (0)', 'PD (1)']).plot(
-        ax=ax1, cmap='Blues', values_format='d')
-    ax1.set_title('Before VAE (Real Only)')
-
-    cm_a = confusion_matrix(y_te, preds_aug)
-    ConfusionMatrixDisplay(cm_a, display_labels=['Non-PD (0)', 'PD (1)']).plot(
-        ax=ax2, cmap='Oranges', values_format='d')
-    ax2.set_title('After VAE (Real + Synthetic)')
-
+def plot_confusion(y_te, preds_aug):
+    fig, ax = plt.subplots(figsize=(7, 6))
+    cm = confusion_matrix(y_te, preds_aug)
+    ConfusionMatrixDisplay(cm, display_labels=['Non-PD (0)', 'PD (1)']).plot(
+        ax=ax, cmap='Oranges', values_format='d')
+    ax.set_title('Confusion Matrix — After VAE (Real + Synthetic)')
     fig.tight_layout()
     path = os.path.join(RESULTS_DIR, 'confusion_matrix.png')
     fig.savefig(path, dpi=150, bbox_inches='tight'); plt.close(fig)
     print(f"  Saved: {path}")
 
 
-def plot_roc(y_te, probs_real, probs_aug):
-    fpr_r, tpr_r, _ = roc_curve(y_te, probs_real)
-    auc_r = auc(fpr_r, tpr_r)
-    fpr_a, tpr_a, _ = roc_curve(y_te, probs_aug)
-    auc_a = auc(fpr_a, tpr_a)
+def plot_roc(y_te, probs_aug):
+    fpr, tpr, _ = roc_curve(y_te, probs_aug)
+    auc_score = auc(fpr, tpr)
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    ax.plot(fpr_r, tpr_r, 'b-', lw=2, label=f'Before VAE (AUC={auc_r:.3f})')
-    ax.plot(fpr_a, tpr_a, 'r-', lw=2, label=f'After VAE (AUC={auc_a:.3f})')
+    ax.plot(fpr, tpr, 'r-', lw=2, label=f'After VAE (AUC={auc_score:.3f})')
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.5)
     ax.set_xlabel('False Positive Rate')
     ax.set_ylabel('True Positive Rate')
-    ax.set_title('ROC Curve: Before vs After VAE')
+    ax.set_title('ROC Curve — After VAE')
     ax.legend(loc='lower right')
     path = os.path.join(RESULTS_DIR, 'roc_curve.png')
     fig.savefig(path, dpi=150, bbox_inches='tight'); plt.close(fig)
     print(f"  Saved: {path}")
 
 
-def plot_training_curves(vae_hist, clf_hists, best_tag):
+def plot_training_curves(vae_hist, clf_hists):
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle('Training History', fontsize=16)
 
@@ -143,15 +95,14 @@ def plot_training_curves(vae_hist, clf_hists, best_tag):
     axes[0, 1].set_title('VAE KL')
     axes[0, 2].plot(vae_hist['total'], 'b-'); axes[0, 2].set_title('VAE Total')
 
-    for tag, h in clf_hists.items():
-        lbl = 'Before VAE' if tag == 'real' else 'After VAE'
-        axes[1, 0].plot(h['train_loss'], label=f'Train ({lbl})', alpha=0.7)
-        axes[1, 0].plot(h['val_loss'], '--', label=f'Val ({lbl})', alpha=0.7)
-        axes[1, 1].plot(h['val_acc'], label=lbl)
-        axes[1, 2].plot(h['val_f1'], label=lbl)
-    axes[1, 0].set_title('Classifier Loss'); axes[1, 0].legend(fontsize=8)
-    axes[1, 1].set_title('Classifier Val Accuracy'); axes[1, 1].legend()
-    axes[1, 2].set_title(f'Classifier Val F1 (best: {best_tag})'); axes[1, 2].legend()
+    h = clf_hists['aug']
+    axes[1, 0].plot(h['train_loss'], label='Train', alpha=0.7)
+    axes[1, 0].plot(h['val_loss'], '--', label='Val', alpha=0.7)
+    axes[1, 1].plot(h['val_acc'])
+    axes[1, 2].plot(h['val_f1'])
+    axes[1, 0].set_title('Classifier Loss (After VAE)'); axes[1, 0].legend(fontsize=8)
+    axes[1, 1].set_title('Classifier Val Accuracy')
+    axes[1, 2].set_title('Classifier Val F1')
 
     for ax in axes.flat:
         ax.set_xlabel('Epoch')
@@ -277,14 +228,13 @@ def main():
     vae.load_state_dict(torch.load(os.path.join(CKPT_DIR, 'vae_best.pt'),
                                     map_location=device, weights_only=True))
 
-    preds_real, probs_real, preds_aug, probs_aug = print_comparison(
+    preds_aug, probs_aug = print_results(
         res['X_feat_test'], res['y_test'], feat_dim, device)
 
     print("\nGenerating plots...")
-    plot_confusion(res['y_test'], preds_real, preds_aug)
-    plot_roc(res['y_test'], probs_real, probs_aug)
-    plot_training_curves(res['vae_history'], res['clf_histories'],
-                         res['best_model'])
+    plot_confusion(res['y_test'], preds_aug)
+    plot_roc(res['y_test'], probs_aug)
+    plot_training_curves(res['vae_history'], res['clf_histories'])
     plot_tsne(vae, res['X_raw_train'], res['y_train'],
               res['syn_raw'], res['syn_y'], device)
     plot_reconstruction(vae, res['X_raw_test'], res['y_test'],
