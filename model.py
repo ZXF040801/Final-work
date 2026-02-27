@@ -161,19 +161,24 @@ def vae_loss_fn(recon, target, mu, logvar, kl_weight=0.001, free_bits=0.1):
 # ========================== CLASSIFIER =====================================
 
 class ClinicalFeatureClassifier(nn.Module):
-    """MLP on 15 clinical features."""
-    def __init__(self, input_dim=15, dropout=0.4):
+    """
+    MLP classifier. Supports both:
+      - 15 clinical features  → hidden 64 → 32 → 1
+      - 79 combined features  → hidden 128 → 64 → 1  (clinical + latent)
+    hidden1 / hidden2 auto-scaled by create_classifier.
+    """
+    def __init__(self, input_dim=15, hidden1=64, hidden2=32, dropout=0.4):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.BatchNorm1d(64),
+            nn.Linear(input_dim, hidden1),
+            nn.BatchNorm1d(hidden1),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 32),
-            nn.BatchNorm1d(32),
+            nn.Linear(hidden1, hidden2),
+            nn.BatchNorm1d(hidden2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(32, 1),
+            nn.Linear(hidden2, 1),
         )
 
     def forward(self, x):
@@ -196,7 +201,13 @@ def create_vae(input_dim=6, seq_len=300, cfg=None):
 
 
 def create_classifier(input_dim=15, cfg=None):
-    return ClinicalFeatureClassifier(input_dim=input_dim, dropout=0.4)
+    """Auto-scale hidden dims based on input size."""
+    if input_dim > 20:
+        # Combined clinical + latent features: wider first layer
+        return ClinicalFeatureClassifier(input_dim=input_dim,
+                                         hidden1=128, hidden2=64, dropout=0.4)
+    return ClinicalFeatureClassifier(input_dim=input_dim,
+                                     hidden1=64, hidden2=32, dropout=0.4)
 
 
 # ========================== TEST ===========================================

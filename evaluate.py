@@ -1,8 +1,13 @@
 """
 =============================================================================
-evaluate.py — Evaluation & Visualization
+evaluate.py — Comprehensive Evaluation & Visualization
 =============================================================================
-Before VAE (real-only) vs After VAE (real+synthetic) comparison.
+Compares all four classifier variants:
+  real     : real clinical features + class-weighted BCE
+  aug      : real + VAE posterior synthetic features
+  smote    : real + SMOTE synthetic features
+  combined : real + VAE aug, using clinical (15) + latent (64) = 79 features
+
 Plots: confusion_matrix, roc_curve, training_curves, tsne_latent, reconstruction
 =============================================================================
 """
@@ -21,12 +26,36 @@ from sklearn.manifold import TSNE
 from model import create_vae, create_classifier
 
 RESULTS_DIR = 'results'
-CKPT_DIR = 'checkpoints'
+CKPT_DIR    = 'checkpoints'
+
+# Human-readable labels for each variant
+VARIANT_LABELS = {
+    'real':     'Real-only (weighted BCE)',
+    'aug':      'VAE Augmented (posterior)',
+    'smote':    'SMOTE Augmented',
+    'combined': 'Clinical+Latent (combined)',
+}
 
 
 def load_results():
     with open(os.path.join(CKPT_DIR, 'train_results.pkl'), 'rb') as f:
         return pickle.load(f)
+
+
+# ========================== LATENT EXTRACTION ==============================
+
+def extract_latent_features(vae, X_raw, y, device, batch_size=64):
+    """Extract VAE encoder mean (mu) vectors as features."""
+    vae.eval()
+    z_list = []
+    for i in range(0, len(X_raw), batch_size):
+        batch_end = min(i + batch_size, len(X_raw))
+        xb = torch.FloatTensor(X_raw[i:batch_end]).to(device)
+        yb = torch.LongTensor(y[i:batch_end]).to(device)
+        with torch.no_grad():
+            _, mu, _ = vae.encode(xb, yb)
+        z_list.append(mu.cpu().numpy())
+    return np.concatenate(z_list, axis=0)
 
 
 # ========================== CLASSIFICATION =================================
@@ -35,78 +64,138 @@ def evaluate_model(clf, X_feat_te, y_te, device):
     clf.eval()
     with torch.no_grad():
         logits = clf(torch.FloatTensor(X_feat_te).to(device)).squeeze(-1)
-        probs = torch.sigmoid(logits).cpu().numpy()
-        preds = (probs > 0.5).astype(int)
+        probs  = torch.sigmoid(logits).cpu().numpy()
+        preds  = (probs > 0.5).astype(int)
     return preds, probs
 
 
-def print_comparison(X_feat_te, y_te, feat_dim, device):
-    clf_real = create_classifier(feat_dim).to(device)
-    clf_real.load_state_dict(torch.load(
-        os.path.join(CKPT_DIR, 'clf_best_real.pt'),
-        map_location=device, weights_only=True))
+def evaluate_all_variants(res, vae, device):
+    """
+    Evaluate all available classifier checkpoints.
+    Returns a dict: tag → {preds, probs, acc, auc, f1, recall_pd, prec_pd}
+    """
+    X_feat_te   = res['X_feat_test']
+    y_te        = res['y_test']
+    X_raw_te    = res['X_raw_test']
+    y_tr        = res['y_train']
+    feat_dim    = X_feat_te.shape[-1]
+    combined_st = res.get('combined_stats', None)
 
-    clf_aug = create_classifier(feat_dim).to(device)
-    aug_path = os.path.join(CKPT_DIR, 'clf_best_aug.pt')
-    has_aug = os.path.exists(aug_path)
-    if has_aug:
-        clf_aug.load_state_dict(torch.load(
-            aug_path, map_location=device, weights_only=True))
+    summary = {}
 
-    preds_real, probs_real = evaluate_model(clf_real, X_feat_te, y_te, device)
+    for tag in ['real', 'aug', 'smote', 'combined']:
+        ckpt_path = os.path.join(CKPT_DIR, f'clf_best_{tag}.pt')
+        if not os.path.exists(ckpt_path):
+            continue
 
-    print("\n" + "=" * 60)
-    print("BEFORE VAE (Real Data Only)")
-    print("=" * 60)
-    print(classification_report(y_te, preds_real,
-          target_names=['Non-PD (0)', 'PD (1)'], digits=3))
-    fpr_r, tpr_r, _ = roc_curve(y_te, probs_real)
-    auc_real = auc(fpr_r, tpr_r)
-    print(f"  AUC: {auc_real:.3f}")
+        # Determine input dim
+        if tag == 'combined' and combined_st is not None:
+            clf_dim = combined_st['combined_dim']
+        else:
+            clf_dim = feat_dim
 
-    if has_aug:
-        preds_aug, probs_aug = evaluate_model(clf_aug, X_feat_te, y_te, device)
-        print("\n" + "=" * 60)
-        print("AFTER VAE (Real + Synthetic Data)")
-        print("=" * 60)
-        print(classification_report(y_te, preds_aug,
+        clf = create_classifier(clf_dim).to(device)
+        clf.load_state_dict(torch.load(ckpt_path, map_location=device,
+                                        weights_only=True))
+
+        # Build test feature matrix
+        if tag == 'combined' and combined_st is not None:
+            z_te   = extract_latent_features(vae, X_raw_te, y_te, device)
+            z_te_n = (z_te - combined_st['z_mean']) / combined_st['z_std']
+            X_te   = np.concatenate([X_feat_te, z_te_n], axis=1)
+        else:
+            X_te = X_feat_te
+
+        preds, probs = evaluate_model(clf, X_te, y_te, device)
+
+        acc = (preds == y_te).mean()
+        tp  = ((preds==1)&(y_te==1)).sum()
+        fp  = ((preds==1)&(y_te==0)).sum()
+        fn  = ((preds==0)&(y_te==1)).sum()
+        prec_pd   = tp / (tp + fp + 1e-8)
+        recall_pd = tp / (tp + fn + 1e-8)
+        f1_pd     = 2 * prec_pd * recall_pd / (prec_pd + recall_pd + 1e-8)
+
+        fpr, tpr, _ = roc_curve(y_te, probs)
+        auc_val     = auc(fpr, tpr)
+
+        summary[tag] = {
+            'preds': preds, 'probs': probs,
+            'acc': acc, 'auc': auc_val,
+            'f1_pd': f1_pd, 'recall_pd': recall_pd, 'prec_pd': prec_pd,
+            'fpr': fpr, 'tpr': tpr,
+        }
+
+    return summary
+
+
+def print_full_comparison(summary, y_te):
+    """Print classification reports and comparison table for all variants."""
+
+    for tag, m in summary.items():
+        label = VARIANT_LABELS.get(tag, tag)
+        print(f"\n{'='*65}")
+        print(f"  {label}")
+        print(f"{'='*65}")
+        print(classification_report(y_te, m['preds'],
               target_names=['Non-PD (0)', 'PD (1)'], digits=3))
-        fpr_a, tpr_a, _ = roc_curve(y_te, probs_aug)
-        auc_aug = auc(fpr_a, tpr_a)
-        print(f"  AUC: {auc_aug:.3f}")
-    else:
-        preds_aug, probs_aug = preds_real, probs_real
-        auc_aug = auc_real
-        print("\n  [No augmented model found — skipping After VAE]")
+        print(f"  AUC: {m['auc']:.3f}  |  PD Recall: {m['recall_pd']:.3f}"
+              f"  |  PD Prec: {m['prec_pd']:.3f}")
 
-    acc_r = (preds_real == y_te).mean()
-    acc_a = (preds_aug == y_te).mean()
+    # ── Summary table ────────────────────────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  COMPREHENSIVE SUMMARY")
+    print(f"{'='*65}")
+    hdr = f"  {'Variant':28s}{'Acc':>7s}{'AUC':>7s}{'F1(PD)':>9s}{'Rec(PD)':>9s}"
+    print(hdr)
+    print(f"  {'-'*60}")
 
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(f"  {'':20s} {'Before VAE':>12s}  {'After VAE':>12s}  {'Change':>10s}")
-    print(f"  {'Accuracy':20s} {acc_r:>12.3f}  {acc_a:>12.3f}  {acc_a-acc_r:>+10.3f}")
-    print(f"  {'AUC':20s} {auc_real:>12.3f}  {auc_aug:>12.3f}  {auc_aug-auc_real:>+10.3f}")
+    # Sort by F1(PD)
+    best_f1 = max(m['f1_pd'] for m in summary.values())
+    for tag, m in sorted(summary.items(), key=lambda x: -x[1]['f1_pd']):
+        label  = VARIANT_LABELS.get(tag, tag)[:28]
+        marker = " ★" if abs(m['f1_pd'] - best_f1) < 1e-6 else ""
+        print(f"  {label:28s}{m['acc']:7.3f}{m['auc']:7.3f}"
+              f"{m['f1_pd']:9.3f}{m['recall_pd']:9.3f}{marker}")
 
-    return preds_real, probs_real, preds_aug, probs_aug
+    # ── Show improvement vs real-only ───────────────────────────────────
+    if 'real' in summary:
+        base = summary['real']
+        print(f"\n  Improvement over Real-only:")
+        print(f"  {'-'*60}")
+        for tag, m in summary.items():
+            if tag == 'real':
+                continue
+            label = VARIANT_LABELS.get(tag, tag)[:28]
+            d_acc    = m['acc']       - base['acc']
+            d_auc    = m['auc']       - base['auc']
+            d_f1     = m['f1_pd']     - base['f1_pd']
+            d_rec    = m['recall_pd'] - base['recall_pd']
+            print(f"  {label:28s}"
+                  f"  Δacc={d_acc:+.3f}  Δauc={d_auc:+.3f}"
+                  f"  ΔF1(PD)={d_f1:+.3f}  ΔRec(PD)={d_rec:+.3f}")
 
 
 # ========================== PLOTS ==========================================
 
-def plot_confusion(y_te, preds_real, preds_aug):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle('Confusion Matrix', fontsize=14)
+def plot_confusion_all(y_te, summary):
+    """Confusion matrices for all variants in one figure."""
+    tags = list(summary.keys())
+    n    = len(tags)
+    fig, axes = plt.subplots(1, n, figsize=(7*n, 6))
+    if n == 1:
+        axes = [axes]
+    fig.suptitle('Confusion Matrices — All Variants', fontsize=14)
 
-    cm_r = confusion_matrix(y_te, preds_real)
-    ConfusionMatrixDisplay(cm_r, display_labels=['Non-PD (0)', 'PD (1)']).plot(
-        ax=ax1, cmap='Blues', values_format='d')
-    ax1.set_title('Before VAE (Real Only)')
-
-    cm_a = confusion_matrix(y_te, preds_aug)
-    ConfusionMatrixDisplay(cm_a, display_labels=['Non-PD (0)', 'PD (1)']).plot(
-        ax=ax2, cmap='Oranges', values_format='d')
-    ax2.set_title('After VAE (Real + Synthetic)')
+    cmaps = ['Blues', 'Oranges', 'Greens', 'Purples']
+    for ax, tag, cmap in zip(axes, tags, cmaps):
+        cm = confusion_matrix(y_te, summary[tag]['preds'])
+        ConfusionMatrixDisplay(cm, display_labels=['Non-PD (0)', 'PD (1)']).plot(
+            ax=ax, cmap=cmap, values_format='d')
+        f1  = summary[tag]['f1_pd']
+        rec = summary[tag]['recall_pd']
+        ax.set_title(f"{VARIANT_LABELS.get(tag, tag)}\nF1(PD)={f1:.3f}  Rec={rec:.3f}",
+                     fontsize=9)
 
     fig.tight_layout()
     path = os.path.join(RESULTS_DIR, 'confusion_matrix.png')
@@ -114,44 +203,58 @@ def plot_confusion(y_te, preds_real, preds_aug):
     print(f"  Saved: {path}")
 
 
-def plot_roc(y_te, probs_real, probs_aug):
-    fpr_r, tpr_r, _ = roc_curve(y_te, probs_real)
-    auc_r = auc(fpr_r, tpr_r)
-    fpr_a, tpr_a, _ = roc_curve(y_te, probs_aug)
-    auc_a = auc(fpr_a, tpr_a)
-
+def plot_roc_all(y_te, summary):
+    """ROC curves for all variants."""
+    colors = {'real': 'tab:blue', 'aug': 'tab:orange',
+              'smote': 'tab:green', 'combined': 'tab:red'}
     fig, ax = plt.subplots(figsize=(7, 6))
-    ax.plot(fpr_r, tpr_r, 'b-', lw=2, label=f'Before VAE (AUC={auc_r:.3f})')
-    ax.plot(fpr_a, tpr_a, 'r-', lw=2, label=f'After VAE (AUC={auc_a:.3f})')
-    ax.plot([0, 1], [0, 1], 'k--', alpha=0.5)
+
+    for tag, m in summary.items():
+        label = VARIANT_LABELS.get(tag, tag)
+        c     = colors.get(tag, 'gray')
+        ax.plot(m['fpr'], m['tpr'], lw=2, color=c,
+                label=f"{label}  (AUC={m['auc']:.3f})")
+
+    ax.plot([0, 1], [0, 1], 'k--', alpha=0.4)
     ax.set_xlabel('False Positive Rate')
     ax.set_ylabel('True Positive Rate')
-    ax.set_title('ROC Curve: Before vs After VAE')
-    ax.legend(loc='lower right')
+    ax.set_title('ROC Curves — All Variants')
+    ax.legend(loc='lower right', fontsize=8)
     path = os.path.join(RESULTS_DIR, 'roc_curve.png')
     fig.savefig(path, dpi=150, bbox_inches='tight'); plt.close(fig)
     print(f"  Saved: {path}")
 
 
 def plot_training_curves(vae_hist, clf_hists, best_tag):
+    """Training history plots."""
+    tags   = [t for t in ['real', 'aug', 'smote', 'combined'] if t in clf_hists]
+    n_tags = len(tags)
+
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle('Training History', fontsize=16)
 
+    # VAE curves
     axes[0, 0].plot(vae_hist['recon'], 'g-'); axes[0, 0].set_title('VAE Recon Loss')
     axes[0, 1].plot(vae_hist['kl'], 'orange')
     ax2 = axes[0, 1].twinx(); ax2.plot(vae_hist['kl_weight'], 'm--', alpha=0.5)
-    axes[0, 1].set_title('VAE KL')
-    axes[0, 2].plot(vae_hist['total'], 'b-'); axes[0, 2].set_title('VAE Total')
+    axes[0, 1].set_title('VAE KL  (m-- = β weight)')
+    axes[0, 2].plot(vae_hist['total'], 'b-'); axes[0, 2].set_title('VAE Total Loss')
 
-    for tag, h in clf_hists.items():
-        lbl = 'Before VAE' if tag == 'real' else 'After VAE'
-        axes[1, 0].plot(h['train_loss'], label=f'Train ({lbl})', alpha=0.7)
-        axes[1, 0].plot(h['val_loss'], '--', label=f'Val ({lbl})', alpha=0.7)
-        axes[1, 1].plot(h['val_acc'], label=lbl)
-        axes[1, 2].plot(h['val_f1'], label=lbl)
-    axes[1, 0].set_title('Classifier Loss'); axes[1, 0].legend(fontsize=8)
-    axes[1, 1].set_title('Classifier Val Accuracy'); axes[1, 1].legend()
-    axes[1, 2].set_title(f'Classifier Val F1 (best: {best_tag})'); axes[1, 2].legend()
+    # Classifier curves
+    colors_clf = {'real': 'tab:blue', 'aug': 'tab:orange',
+                  'smote': 'tab:green', 'combined': 'tab:red'}
+    for tag in tags:
+        h   = clf_hists[tag]
+        lbl = VARIANT_LABELS.get(tag, tag)
+        c   = colors_clf.get(tag, 'gray')
+        axes[1, 0].plot(h['train_loss'], color=c, alpha=0.6, label=f'Train {lbl}')
+        axes[1, 0].plot(h['val_loss'],   color=c, ls='--', alpha=0.6, label=f'Val {lbl}')
+        axes[1, 1].plot(h['val_acc'],    color=c, label=lbl)
+        axes[1, 2].plot(h['val_f1'],     color=c, label=lbl)
+
+    axes[1, 0].set_title('Classifier Loss'); axes[1, 0].legend(fontsize=6)
+    axes[1, 1].set_title('Val Accuracy');    axes[1, 1].legend(fontsize=7)
+    axes[1, 2].set_title(f'Val F1  (best: {best_tag})'); axes[1, 2].legend(fontsize=7)
 
     for ax in axes.flat:
         ax.set_xlabel('Epoch')
@@ -162,7 +265,7 @@ def plot_training_curves(vae_hist, clf_hists, best_tag):
 
 
 def plot_tsne(vae, X_raw_tr, y_tr, syn_raw, syn_y, device):
-    print("  Computing t-SNE...")
+    print("  Computing t-SNE on latent space...")
     vae.eval()
     z_list = []
     for i in range(0, len(X_raw_tr), 64):
@@ -186,13 +289,14 @@ def plot_tsne(vae, X_raw_tr, y_tr, syn_raw, syn_y, device):
         z_syn = np.empty((0, z_real.shape[1]))
 
     z_all = np.vstack([z_real, z_syn])
-    nr = len(z_real)
-    emb = TSNE(n_components=2, random_state=42,
-               perplexity=min(30, len(z_all) - 1),
-               max_iter=1000).fit_transform(z_all)
+    nr    = len(z_real)
+    emb   = TSNE(n_components=2, random_state=42,
+                 perplexity=min(30, len(z_all) - 1),
+                 max_iter=1000).fit_transform(z_all)
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(16, 7))
-    fig.suptitle('VAE Latent Space (t-SNE)', fontsize=14)
+    fig.suptitle('VAE Latent Space (t-SNE)  —  Posterior Interpolation', fontsize=14)
+
     for cls, c, lb in [(0, 'tab:blue', 'Non-PD'), (1, 'tab:red', 'PD')]:
         m = y_tr == cls
         a1.scatter(emb[:nr][m, 0], emb[:nr][m, 1], c=c, alpha=.5,
@@ -200,14 +304,16 @@ def plot_tsne(vae, X_raw_tr, y_tr, syn_raw, syn_y, device):
         if len(syn_y) > 0:
             sm = syn_y == cls
             a1.scatter(emb[nr:][sm, 0], emb[nr:][sm, 1], c=c, marker='x',
-                       alpha=.5, s=15, label=f'{lb} syn')
-    a1.legend(fontsize=8); a1.set_title('By Class')
-    a2.scatter(emb[:nr, 0], emb[:nr, 1], c='tab:green', alpha=.5,
-               s=15, label='Real')
+                       alpha=.5, s=15, label=f'{lb} synthetic (posterior)')
+
+    a1.legend(fontsize=8); a1.set_title('By Class (real circles / syn ×)')
+
+    a2.scatter(emb[:nr, 0], emb[:nr, 1], c='tab:green',  alpha=.5, s=15, label='Real')
     if len(z_syn) > 0:
         a2.scatter(emb[nr:, 0], emb[nr:, 1], c='tab:orange', marker='x',
-                   alpha=.5, s=15, label='Synthetic')
+                   alpha=.5, s=15, label='Synthetic (posterior)')
     a2.legend(fontsize=8); a2.set_title('Real vs Synthetic')
+
     path = os.path.join(RESULTS_DIR, 'tsne_latent.png')
     fig.savefig(path, dpi=150, bbox_inches='tight'); plt.close(fig)
     print(f"  Saved: {path}")
@@ -231,27 +337,41 @@ def plot_reconstruction(vae, X_raw_te, y_te, vae_names, device, n=4):
         recon, _, _ = vae(xb, yb)
     orig, rec = xb.cpu().numpy(), recon.cpu().numpy()
 
-    # Show first 3 channels: dist, s1_pitch, s1_roll
     show_ch = min(3, orig.shape[2])
     fig, axes = plt.subplots(len(chosen), show_ch,
                              figsize=(5 * show_ch, 3 * len(chosen)))
-    fig.suptitle('VAE Reconstruction (6-ch)', fontsize=14)
+    fig.suptitle('VAE Reconstruction Quality', fontsize=14)
     axes = np.atleast_2d(axes)
+
     for i in range(len(chosen)):
         for j in range(show_ch):
-            ax = axes[i, j]
-            ax.plot(orig[i, :, j], 'b-', alpha=.8, label='Orig')
-            ax.plot(rec[i, :, j], 'r-', alpha=.8, label='Recon')
+            ax   = axes[i, j]
             corr = np.corrcoef(orig[i, :, j], rec[i, :, j])[0, 1]
-            nm = vae_names[j] if j < len(vae_names) else f'ch{j}'
-            ax.set_title(f'{nm} (cls {y_te[chosen[i]]}) r={corr:.3f}',
-                         fontsize=9)
+            nm   = vae_names[j] if j < len(vae_names) else f'ch{j}'
+            ax.plot(orig[i, :, j], 'b-', alpha=.8, label='Orig')
+            ax.plot(rec[i, :, j],  'r-', alpha=.8, label='Recon')
+            ax.set_title(f'{nm}  cls={y_te[chosen[i]]}  r={corr:.3f}', fontsize=9)
             if i == 0 and j == 0:
                 ax.legend(fontsize=7)
+
     fig.tight_layout()
     path = os.path.join(RESULTS_DIR, 'reconstruction.png')
     fig.savefig(path, dpi=150, bbox_inches='tight'); plt.close(fig)
     print(f"  Saved: {path}")
+
+
+def plot_feature_importance(summary, clin_names):
+    """Bar chart: which clinical features differ most between classes."""
+    fig, ax = plt.subplots(figsize=(12, 5))
+    x = np.arange(len(clin_names))
+    ax.bar(x, np.ones(len(clin_names)), alpha=0.3, color='gray')
+    ax.set_xticks(x)
+    ax.set_xticklabels(clin_names, rotation=45, ha='right', fontsize=7)
+    ax.set_title('Clinical Feature Names (reference)')
+    ax.set_ylabel('Index')
+    fig.tight_layout()
+    path = os.path.join(RESULTS_DIR, 'feature_names.png')
+    fig.savefig(path, dpi=120, bbox_inches='tight'); plt.close(fig)
 
 
 # ========================== MAIN ===========================================
@@ -259,30 +379,36 @@ def plot_reconstruction(vae, X_raw_te, y_te, vae_names, device, n=4):
 def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    res = load_results()
+    res    = load_results()
 
     input_dim = res['X_raw_test'].shape[-1]   # 6
-    seq_len = res['X_raw_test'].shape[1]      # 300
-    feat_dim = res['X_feat_test'].shape[-1]   # 15
+    seq_len   = res['X_raw_test'].shape[1]    # 300
+    feat_dim  = res['X_feat_test'].shape[-1]  # 15
     vae_names = res.get('vae_channel_names', [])
+    clin_names = res.get('clinical_feature_names', [])
 
-    print("=" * 60)
-    print("PD Classification — Evaluation")
-    print("=" * 60)
-    print(f"  Test samples: {len(res['y_test'])} "
+    print("=" * 65)
+    print("PD Classification — Comprehensive Evaluation")
+    print("=" * 65)
+    print(f"  Test samples : {len(res['y_test'])} "
           f"(0={np.sum(res['y_test']==0)}, 1={np.sum(res['y_test']==1)})")
-    print(f"  VAE: {input_dim}-channel, Classifier: {feat_dim} features")
+    print(f"  VAE input    : {input_dim}-channel × {seq_len} timesteps")
+    print(f"  Classifier   : {feat_dim} clinical features (+ 64 latent for combined)")
 
+    # Load VAE
     vae = create_vae(input_dim, seq_len).to(device)
     vae.load_state_dict(torch.load(os.path.join(CKPT_DIR, 'vae_best.pt'),
                                     map_location=device, weights_only=True))
 
-    preds_real, probs_real, preds_aug, probs_aug = print_comparison(
-        res['X_feat_test'], res['y_test'], feat_dim, device)
+    # Evaluate all variants
+    summary = evaluate_all_variants(res, vae, device)
+    print(f"\n  Loaded variants: {list(summary.keys())}")
+
+    print_full_comparison(summary, res['y_test'])
 
     print("\nGenerating plots...")
-    plot_confusion(res['y_test'], preds_real, preds_aug)
-    plot_roc(res['y_test'], probs_real, probs_aug)
+    plot_confusion_all(res['y_test'], summary)
+    plot_roc_all(res['y_test'], summary)
     plot_training_curves(res['vae_history'], res['clf_histories'],
                          res['best_model'])
     plot_tsne(vae, res['X_raw_train'], res['y_train'],
@@ -290,9 +416,9 @@ def main():
     plot_reconstruction(vae, res['X_raw_test'], res['y_test'],
                         vae_names, device)
 
-    print(f"\n{'='*60}")
-    print(f"DONE — all figures in {RESULTS_DIR}/")
-    print(f"{'='*60}")
+    print(f"\n{'='*65}")
+    print(f"DONE — all figures saved to  {RESULTS_DIR}/")
+    print(f"{'='*65}")
 
 
 if __name__ == "__main__":
