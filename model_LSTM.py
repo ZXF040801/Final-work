@@ -3,17 +3,15 @@ import torch.nn as nn
 
 
 # ========================== LSTM FEATURE VAE ================================
-# VAE Encoder/Decoder 均使用 LSTM，把 feat_dim 个特征当作序列处理
+# Encoder: BiLSTM + Attention Pooling
+# Decoder: 单向 LSTM，hidden 由 latent 初始化
 
 class ConditionalLSTMFeatureVAE(nn.Module):
     """
     Conditional LSTM-VAE，直接在归一化临床特征空间操作。
-
-    把 (B, feat_dim) 的特征向量视为 feat_dim 个时间步 × 1 维的序列：
-      (B, feat_dim) → (B, feat_dim, 1)
-
-    Encoder: BiLSTM + Attention Pooling → mu / logvar
-    Decoder: LSTM（隐态由 latent 初始化）→ (B, feat_dim, hidden) → FC → (B, feat_dim)
+    把 (B, feat_dim) 视为 feat_dim 个时间步 x 1 维的序列。
+    Encoder: BiLSTM + Attention -> mu / logvar
+    Decoder: LSTM（hidden 由 latent 初始化）-> (B, feat_dim)
     """
     def __init__(self, feat_dim=15, hidden_dim=64, latent_dim=16,
                  num_layers=2, n_classes=2, embed_dim=8, dropout=0.2):
@@ -25,8 +23,7 @@ class ConditionalLSTMFeatureVAE(nn.Module):
 
         self.class_embed = nn.Embedding(n_classes, embed_dim)
 
-        # ── Encoder: BiLSTM ──────────────────────────────────────────────
-        # 输入每个时间步: 1(特征值) + embed_dim(类别)
+        # Encoder: BiLSTM
         self.encoder = nn.LSTM(
             input_size    = 1 + embed_dim,
             hidden_size   = hidden_dim,
@@ -35,21 +32,14 @@ class ConditionalLSTMFeatureVAE(nn.Module):
             dropout       = dropout if num_layers > 1 else 0.0,
             bidirectional = True,
         )
-        enc_out_dim = hidden_dim * 2  # 双向
-
-        # Attention pooling
-        self.attn_w = nn.Linear(enc_out_dim, 1)
-
+        enc_out_dim = hidden_dim * 2
+        self.attn_w    = nn.Linear(enc_out_dim, 1)
         self.fc_mu     = nn.Linear(enc_out_dim, latent_dim)
         self.fc_logvar = nn.Linear(enc_out_dim, latent_dim)
 
-        # ── Decoder: 单向 LSTM ───────────────────────────────────────────
-        # 每个时间步输入: latent + embed
-        self.latent_to_h = nn.Linear(latent_dim + embed_dim,
-                                     hidden_dim * num_layers)
-        self.latent_to_c = nn.Linear(latent_dim + embed_dim,
-                                     hidden_dim * num_layers)
-
+        # Decoder: 单向 LSTM
+        self.latent_to_h = nn.Linear(latent_dim + embed_dim, hidden_dim * num_layers)
+        self.latent_to_c = nn.Linear(latent_dim + embed_dim, hidden_dim * num_layers)
         self.decoder = nn.LSTM(
             input_size  = latent_dim + embed_dim,
             hidden_size = hidden_dim,
@@ -57,26 +47,20 @@ class ConditionalLSTMFeatureVAE(nn.Module):
             batch_first = True,
             dropout     = dropout if num_layers > 1 else 0.0,
         )
-
-        self.fc_out = nn.Linear(hidden_dim, 1)   # 每个时间步输出 1 个标量
+        self.fc_out = nn.Linear(hidden_dim, 1)
 
     def _attn_pool(self, enc_out):
-        """enc_out: (B, T, enc_out_dim) → (B, enc_out_dim)"""
-        scores  = self.attn_w(enc_out).squeeze(-1)       # (B, T)
-        weights = torch.softmax(scores, dim=-1)           # (B, T)
+        scores  = self.attn_w(enc_out).squeeze(-1)
+        weights = torch.softmax(scores, dim=-1)
         return torch.bmm(weights.unsqueeze(1), enc_out).squeeze(1)
 
     def encode(self, x, labels):
-        """x: (B, feat_dim), labels: (B,) → z, mu, logvar"""
-        B, F = x.shape
-        emb     = self.class_embed(labels)                # (B, embed_dim)
-        emb_rep = emb.unsqueeze(1).expand(-1, F, -1)     # (B, F, embed_dim)
-        x_seq   = x.unsqueeze(-1)                        # (B, F, 1)
-        inp     = torch.cat([x_seq, emb_rep], dim=-1)    # (B, F, 1+embed)
-
-        enc_out, _ = self.encoder(inp)                   # (B, F, hidden*2)
-        ctx = self._attn_pool(enc_out)                   # (B, hidden*2)
-
+        B, F    = x.shape
+        emb     = self.class_embed(labels)
+        emb_rep = emb.unsqueeze(1).expand(-1, F, -1)
+        inp     = torch.cat([x.unsqueeze(-1), emb_rep], dim=-1)  # (B, F, 1+embed)
+        enc_out, _ = self.encoder(inp)
+        ctx    = self._attn_pool(enc_out)
         mu     = self.fc_mu(ctx)
         logvar = self.fc_logvar(ctx)
         std    = torch.exp(0.5 * logvar)
@@ -84,37 +68,24 @@ class ConditionalLSTMFeatureVAE(nn.Module):
         return z, mu, logvar
 
     def decode(self, z, labels):
-        """z: (B, latent_dim), labels: (B,) → recon: (B, feat_dim)"""
         B      = z.size(0)
-        emb    = self.class_embed(labels)                # (B, embed_dim)
-        z_cond = torch.cat([z, emb], dim=-1)             # (B, latent+embed)
-
-        # 用 latent 初始化 hidden state
-        h0 = self.latent_to_h(z_cond) \
-                 .view(B, self.num_layers, self.hidden_dim) \
-                 .permute(1, 0, 2).contiguous()
-        c0 = self.latent_to_c(z_cond) \
-                 .view(B, self.num_layers, self.hidden_dim) \
-                 .permute(1, 0, 2).contiguous()
-
-        # 每个时间步都输入同一个 z_cond
-        z_rep   = z_cond.unsqueeze(1).expand(-1, self.feat_dim, -1)  # (B, F, latent+embed)
-        dec_out, _ = self.decoder(z_rep, (h0, c0))      # (B, F, hidden)
-        out = self.fc_out(dec_out).squeeze(-1)           # (B, F)
-        return out
+        emb    = self.class_embed(labels)
+        z_cond = torch.cat([z, emb], dim=-1)
+        h0 = self.latent_to_h(z_cond).view(B, self.num_layers, self.hidden_dim).permute(1,0,2).contiguous()
+        c0 = self.latent_to_c(z_cond).view(B, self.num_layers, self.hidden_dim).permute(1,0,2).contiguous()
+        z_rep      = z_cond.unsqueeze(1).expand(-1, self.feat_dim, -1)
+        dec_out, _ = self.decoder(z_rep, (h0, c0))
+        return self.fc_out(dec_out).squeeze(-1)  # (B, feat_dim)
 
     def forward(self, x, labels):
         z, mu, logvar = self.encode(x, labels)
-        recon = self.decode(z, labels)
-        return recon, mu, logvar
+        return self.decode(z, labels), mu, logvar
 
     def generate(self, class_label, num_samples=1, device='cpu'):
-        """采样 z ~ N(0,I)，生成归一化特征向量 (num_samples, feat_dim)"""
         self.eval()
         with torch.no_grad():
             z      = torch.randn(num_samples, self.latent_dim).to(device)
-            labels = torch.full((num_samples,), class_label,
-                                dtype=torch.long).to(device)
+            labels = torch.full((num_samples,), class_label, dtype=torch.long).to(device)
             return self.decode(z, labels)
 
 
@@ -222,14 +193,14 @@ def create_classifier(input_dim=15, cfg=None):
 if __name__ == "__main__":
     B, F = 8, 10
 
-    # VAE test (LSTM-VAE)
+    # VAE test
     vae    = create_vae(F)
     x      = torch.randn(B, F)
     labels = torch.randint(0, 2, (B,))
 
     recon, mu, lv = vae(x, labels)
-    print(f"[LSTM-VAE]  input={x.shape} → recon={recon.shape}")
-    print(f"            mu={mu.shape}, logvar={lv.shape}")
+    print(f"[VAE]  input={x.shape} → recon={recon.shape}")
+    print(f"       mu={mu.shape}, logvar={lv.shape}")
     print(f"  Params: {sum(p.numel() for p in vae.parameters()):,}")
 
     loss, rl, kl = vae_loss_fn(recon, x, mu, lv)

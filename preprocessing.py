@@ -16,7 +16,7 @@ class Config:
     LOWPASS_ORDER = 4
 
     WINDOW_SEC = 5.0
-    OVERLAP = 0.75
+    OVERLAP = 0.90
     WINDOW_LEN = int(WINDOW_SEC * FS)   # 300
     STRIDE = int(WINDOW_LEN * (1 - OVERLAP))  # 75
 
