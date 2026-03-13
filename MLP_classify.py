@@ -12,26 +12,21 @@ from sklearn.metrics import (
 )
 from preprocessing import patient_aware_split, compute_normalization_stats, normalize
 
-# ── 配置（与 train.py 分类器保持一致）─────────────────────────────────────
 SEED        = 42
 DATA_PATH   = 'preprocessed/preprocessed_data.pkl'
 CKPT_DIR    = 'checkpoints'
 RESULTS_DIR = 'results'
 DEVICE      = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# 模型结构
-DROPOUT     = 0.6   # 进一步加大正则
+DROPOUT     = 0.6
 
-# 训练超参
-EPOCHS        = 500   # 减少训练轮数，欠拟合更明显
+EPOCHS        = 500
 BATCH         = 32
-LR            = 5e-4  # 降低学习率，收敛更慢
-WD            = 5e-2  # 加大权重衰减
+LR            = 5e-4
+WD            = 5e-2
 LABEL_SMOOTH  = 0.1
 PATIENCE      = 9999
 
-
-# ── 与 train.py 相同的 LabelSmoothingBCELoss ──────────────────────────────
 class LabelSmoothingBCELoss(nn.Module):
     def __init__(self, s=0.1):
         super().__init__()
@@ -42,16 +37,12 @@ class LabelSmoothingBCELoss(nn.Module):
         return nn.functional.binary_cross_entropy_with_logits(logits, targets)
 
 
-# ── 模型 ──────────────────────────────────────────────────────────────────
 class MLPClassifier(nn.Module):
-    """
-    MLP 直接对临床特征分类（极简版，作为对照基线）。
-    单隐层，高dropout，容量极小。
-    """
+
     def __init__(self, input_dim=15, dropout=0.6):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 16),   # 单隐层，极小宽度
+            nn.Linear(input_dim, 16),
             nn.BatchNorm1d(16),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -62,7 +53,7 @@ class MLPClassifier(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-# ── 主流程 ────────────────────────────────────────────────────────────────
+
 def main():
     np.random.seed(SEED); torch.manual_seed(SEED)
     if torch.cuda.is_available():
@@ -70,7 +61,6 @@ def main():
     os.makedirs(CKPT_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # 数据加载（与 train.py 完全相同的 split）
     with open(DATA_PATH, 'rb') as f:
         data = pickle.load(f)
     X_raw  = data['X_raw']
@@ -85,7 +75,6 @@ def main():
     print(f"[Split] Train: {len(split['y_tr'])} ({dict(Counter(split['y_tr']))})")
     print(f"[Split] Test:  {len(split['y_te'])} ({dict(Counter(split['y_te']))})")
 
-    # 归一化（与 train.py 相同）
     feat_mean = split['X_feat_tr'].mean(axis=0)
     feat_std  = split['X_feat_tr'].std(axis=0)
     feat_std[feat_std < 1e-8] = 1.0
@@ -93,7 +82,6 @@ def main():
     X_te = (split['X_feat_te'] - feat_mean) / feat_std
     y_tr, y_te = split['y_tr'], split['y_te']
 
-    # 预加载：整个数据集一次性搬到 device，训练时无需每 batch to(device)
     X_tr_dev = torch.FloatTensor(X_tr).to(DEVICE)
     y_tr_dev = torch.FloatTensor(y_tr).to(DEVICE)
     X_te_dev = torch.FloatTensor(X_te).to(DEVICE)
@@ -106,12 +94,11 @@ def main():
         TensorDataset(X_te_dev, y_te_dev),
         batch_size=BATCH)
 
-    # 模型
+
     model = MLPClassifier(input_dim=X_tr.shape[1], dropout=DROPOUT).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\n[Model] MLP | params={n_params:,} | device={DEVICE}")
 
-    # 优化器与调度（与 train.py 完全一致）
     criterion = LabelSmoothingBCELoss(LABEL_SMOOTH)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -132,7 +119,6 @@ def main():
     for epoch in range(EPOCHS):
         t0 = time.time()
 
-        # 训练
         model.train()
         tr_loss, n = 0.0, 0
         for xb, yb in train_dl:
@@ -143,7 +129,6 @@ def main():
             tr_loss += loss.item() * len(yb); n += len(yb)
         scheduler.step()
 
-        # 验证
         model.eval()
         probs_list, true_list, vl, vn = [], [], 0.0, 0
         with torch.no_grad():
@@ -181,7 +166,6 @@ def main():
                   f"Acc: {acc:.3f} | F1: {f1:.3f} | "
                   f"Rec(PD): {rec:.3f} | {time.time()-t0:.1f}s")
 
-    # ── 最终评估 ──────────────────────────────────────────────────────────
     model.load_state_dict(torch.load(ckpt, map_location=DEVICE, weights_only=True))
     model.eval()
     probs_list, true_list = [], []
@@ -196,15 +180,26 @@ def main():
     fpr, tpr, _ = roc_curve(truth, probs)
     auc_score   = auc(fpr, tpr)
 
+    tp = int(((preds == 1) & (truth == 1)).sum())
+    tn = int(((preds == 0) & (truth == 0)).sum())
+    fp = int(((preds == 1) & (truth == 0)).sum())
+    fn = int(((preds == 0) & (truth == 1)).sum())
+    sensitivity = tp / (tp + fn + 1e-8)
+    specificity = tn / (tn + fp + 1e-8)
+    mcc_denom   = ((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn)) ** 0.5
+    mcc         = (tp*tn - fp*fn) / (mcc_denom + 1e-8)
+
     print(f"\n{'='*60}")
     print(f"MLP CLASSIFIER — Test Results")
     print(f"{'='*60}")
     print(classification_report(truth, preds,
           target_names=['Non-PD (0)', 'PD (1)'], digits=3, zero_division=0))
-    print(f"  AUC: {auc_score:.3f}")
+    print(f"  AUC:         {auc_score:.3f}")
+    print(f"  Sensitivity: {sensitivity:.3f} ")
+    print(f"  Specificity: {specificity:.3f} ")
+    print(f"  MCC:         {mcc:.3f}")
     print(f"{'='*60}")
 
-    # ── 图表 ──────────────────────────────────────────────────────────────
     cm = confusion_matrix(truth, preds)
     fig, ax = plt.subplots(figsize=(7, 6))
     ConfusionMatrixDisplay(cm, display_labels=['Non-PD (0)', 'PD (1)']).plot(

@@ -7,7 +7,7 @@ from collections import Counter
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from model_LSTM import (create_vae, create_classifier, vae_loss_fn)
+from model_MLP import (create_vae, create_classifier, vae_loss_fn)
 from preprocessing import (
     patient_aware_split, compute_normalization_stats, normalize,
     extract_features_batch
@@ -20,24 +20,21 @@ class TrainConfig:
     DATA_PATH = 'preprocessed/preprocessed_data.pkl'
     CKPT_DIR  = 'checkpoints'
 
-    # ── Feature-Space LSTM-VAE ────────────────────────────────────────
-    VAE_WARMUP_EPOCHS = 200   # Phase 1a: β=0，纯重建
-    VAE_ANNEAL_EPOCHS = 400   # Phase 1b: β 从 0 线性升至 KL_MAX
+    VAE_WARMUP_EPOCHS = 200
+    VAE_ANNEAL_EPOCHS = 400
     VAE_BATCH  = 64
     VAE_LR     = 1e-3
     KL_MAX     = 0.005
     FREE_BITS  = 0.1
 
-    # ── Classifier ────────────────────────────────────────────────────
-    CLF_EPOCHS   = 1000   # 固定训练轮数，不提前停止
+    CLF_EPOCHS   = 1000
     CLF_BATCH    = 32
     CLF_LR       = 1e-3
     CLF_WD       = 1e-2
     LABEL_SMOOTH = 0.1
-    PATIENCE     = 9999   # 关闭早停
+    PATIENCE     = 9999
 
-    GEN_NOISE = 0.02      # 特征空间添加的微小噪声
-
+    GEN_NOISE = 0.02
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -54,9 +51,6 @@ class LabelSmoothingBCELoss(nn.Module):
     def forward(self, logits, targets):
         targets = targets.float() * (1 - self.s) + 0.5 * self.s
         return nn.functional.binary_cross_entropy_with_logits(logits, targets)
-
-
-# ========================== DATA ===========================================
 
 def load_data(cfg):
     with open(cfg.DATA_PATH, 'rb') as f:
@@ -75,12 +69,10 @@ def load_data(cfg):
     print(f"[Split] Train: {len(split['y_tr'])} ({dict(Counter(split['y_tr']))})")
     print(f"[Split] Test:  {len(split['y_te'])} ({dict(Counter(split['y_te']))})")
 
-    # Normalize raw 6-ch（保留给 evaluate 重建图备用）
     raw_mean, raw_std = compute_normalization_stats(split['X_raw_tr'])
     split['X_raw_tr'] = normalize(split['X_raw_tr'], raw_mean, raw_std)
     split['X_raw_te'] = normalize(split['X_raw_te'], raw_mean, raw_std)
 
-    # Normalize 15 features（VAE 和 Classifier 共用同一份）
     feat_mean = split['X_feat_tr'].mean(axis=0)
     feat_std  = split['X_feat_tr'].std(axis=0)
     feat_std[feat_std < 1e-8] = 1.0
@@ -90,14 +82,9 @@ def load_data(cfg):
     return split, raw_mean, raw_std, feat_mean, feat_std, vae_names, clin_names
 
 
-# ========================== PHASE 1: LSTM-VAE (Feature Space) ==============
 
 def train_vae(X_feat_tr, y_tr, cfg):
-    """
-    在归一化的 15 维特征空间训练 LSTM-VAE。
-    输入 X_feat_tr: (N, 15)，已归一化。
-    LSTM 把 15 个特征当作长度为 15 的时间序列处理。
-    """
+
     device       = cfg.DEVICE
     feat_dim     = X_feat_tr.shape[-1]   # 15
     total_epochs = cfg.VAE_WARMUP_EPOCHS + cfg.VAE_ANNEAL_EPOCHS
@@ -107,7 +94,6 @@ def train_vae(X_feat_tr, y_tr, cfg):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_epochs, eta_min=1e-5)
 
-    # 预加载到 device
     X_dev = torch.FloatTensor(X_feat_tr).to(device)
     y_dev = torch.LongTensor(y_tr).to(device)
     loader = DataLoader(
@@ -176,7 +162,6 @@ def train_vae(X_feat_tr, y_tr, cfg):
         os.path.join(cfg.CKPT_DIR, 'vae_best.pt'),
         map_location=device, weights_only=True))
 
-    # ── 质量检验：per-feature 相关系数 ───────────────────────────────
     vae.eval()
     with torch.no_grad():
         n_check = min(len(X_feat_tr), 256)
@@ -197,14 +182,8 @@ def train_vae(X_feat_tr, y_tr, cfg):
     return vae, history
 
 
-# ========================== PHASE 2: GENERATE FEATURES ====================
 
 def generate_synthetic(vae, y_tr, cfg):
-    """
-    直接在归一化特征空间生成少数类样本。
-    无需生成原始信号，也无需重新提取特征。
-    返回 syn_feat (N, 15) 已归一化，syn_y (N,)
-    """
     device         = cfg.DEVICE
     counts         = Counter(y_tr)
     majority_count = max(counts.values())
@@ -248,7 +227,6 @@ def generate_synthetic(vae, y_tr, cfg):
     return syn_feat, syn_y
 
 
-# ========================== PHASE 3: CLASSIFIER ============================
 
 def train_classifier(X_feat_tr, y_tr, X_feat_te, y_te, tag, cfg):
     device    = cfg.DEVICE
@@ -262,7 +240,6 @@ def train_classifier(X_feat_tr, y_tr, X_feat_te, y_te, tag, cfg):
     pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # 预加载到 device
     X_tr_dev = torch.FloatTensor(X_feat_tr).to(device)
     y_tr_dev = torch.FloatTensor(y_tr).to(device)
     X_te_dev = torch.FloatTensor(X_feat_te).to(device)
@@ -329,9 +306,6 @@ def train_classifier(X_feat_tr, y_tr, X_feat_te, y_te, tag, cfg):
 
 
 def train_classifiers(X_feat_tr, y_tr, X_feat_te, y_te, syn_feat, syn_y, cfg):
-    """
-    syn_feat 是 Feature-VAE 直接生成的归一化特征，无需再归一化，直接拼接。
-    """
     print(f"\n{'='*60}")
     print(f"PHASE 3: Training Classifier on Real + Synthetic Features")
     print(f"  Real: {len(y_tr)}, Synthetic: {len(syn_y)}")
@@ -349,8 +323,6 @@ def train_classifiers(X_feat_tr, y_tr, X_feat_te, y_te, syn_feat, syn_y, cfg):
     return {'aug': hist_aug}
 
 
-# ========================== MAIN ===========================================
-
 def main():
     cfg = TrainConfig()
     set_seed(cfg.SEED)
@@ -361,19 +333,15 @@ def main():
     split, raw_mean, raw_std, feat_mean, feat_std, vae_names, clin_names = \
         load_data(cfg)
 
-    # Phase 1: LSTM-VAE 在特征空间训练
     vae, vae_hist = train_vae(split['X_feat_tr'], split['y_tr'], cfg)
 
-    # Phase 2: 直接生成归一化特征（跳过原始信号生成）
     syn_feat, syn_y = generate_synthetic(vae, split['y_tr'], cfg)
 
-    # Phase 3: Classifier
     clf_hists = train_classifiers(
         split['X_feat_tr'], split['y_tr'],
         split['X_feat_te'], split['y_te'],
         syn_feat, syn_y, cfg)
 
-    # ── Loss 趋势图 ──────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(9, 5))
     ex = range(1, len(vae_hist['recon']) + 1)
     ax.plot(ex, vae_hist['total'], 'b-', lw=2, label='Total Loss')
@@ -400,7 +368,6 @@ def main():
                 dpi=150, bbox_inches='tight'); plt.close(fig)
     print(f"  Saved: {results_dir}/vae_loss_trend.png, clf_loss_trend.png")
 
-    # ── 保存结果 ──────────────────────────────────────────────────────────
     save_dict = {
         'vae_history':   vae_hist,
         'clf_histories': clf_hists,

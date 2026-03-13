@@ -2,17 +2,8 @@ import torch
 import torch.nn as nn
 
 
-# ========================== LSTM FEATURE VAE ================================
-# Encoder: BiLSTM + Attention Pooling
-# Decoder: 单向 LSTM，hidden 由 latent 初始化
 
 class ConditionalLSTMFeatureVAE(nn.Module):
-    """
-    Conditional LSTM-VAE，直接在归一化临床特征空间操作。
-    把 (B, feat_dim) 视为 feat_dim 个时间步 x 1 维的序列。
-    Encoder: BiLSTM + Attention -> mu / logvar
-    Decoder: LSTM（hidden 由 latent 初始化）-> (B, feat_dim)
-    """
     def __init__(self, feat_dim=15, hidden_dim=64, latent_dim=16,
                  num_layers=2, n_classes=2, embed_dim=8, dropout=0.2):
         super().__init__()
@@ -23,7 +14,6 @@ class ConditionalLSTMFeatureVAE(nn.Module):
 
         self.class_embed = nn.Embedding(n_classes, embed_dim)
 
-        # Encoder: BiLSTM
         self.encoder = nn.LSTM(
             input_size    = 1 + embed_dim,
             hidden_size   = hidden_dim,
@@ -37,7 +27,6 @@ class ConditionalLSTMFeatureVAE(nn.Module):
         self.fc_mu     = nn.Linear(enc_out_dim, latent_dim)
         self.fc_logvar = nn.Linear(enc_out_dim, latent_dim)
 
-        # Decoder: 单向 LSTM
         self.latent_to_h = nn.Linear(latent_dim + embed_dim, hidden_dim * num_layers)
         self.latent_to_c = nn.Linear(latent_dim + embed_dim, hidden_dim * num_layers)
         self.decoder = nn.LSTM(
@@ -90,7 +79,6 @@ class ConditionalLSTMFeatureVAE(nn.Module):
 
 
 def vae_loss_fn(recon, target, mu, logvar, kl_weight=0.001, free_bits=0.1):
-    """MSE 重建损失 + KL（带 free bits）"""
     recon_loss = nn.functional.mse_loss(recon, target, reduction='mean')
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
     kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
@@ -98,21 +86,8 @@ def vae_loss_fn(recon, target, mu, logvar, kl_weight=0.001, free_bits=0.1):
     total      = recon_loss + kl_weight * kl_loss
     return total, recon_loss, kl_loss
 
-
-# ========================== LSTM CLASSIFIER ================================
-# 分类器部分与原 model_LSTM.py 完全相同：BiLSTM + Attention
-
 class ClinicalFeatureClassifier(nn.Module):
-    """
-    BiLSTM + Attention classifier on clinical features.
 
-    Pipeline:
-      (B, feat_dim) → unsqueeze → (B, feat_dim, 1)
-                    → feat_proj(16) → (B, feat_dim, 16)
-                    → BiLSTM(128)   → (B, feat_dim, 256)
-                    → attention + last_hidden → concat(512)
-                    → BN → FC(256) → FC(64) → FC(1)
-    """
     def __init__(self, input_dim=15, hidden_dim=128, num_layers=2, dropout=0.4):
         super().__init__()
         self.feat_proj = nn.Sequential(
@@ -128,8 +103,8 @@ class ClinicalFeatureClassifier(nn.Module):
             dropout       = dropout if num_layers > 1 else 0.0,
             bidirectional = True,
         )
-        enc_dim  = hidden_dim * 2   # 256
-        fuse_dim = enc_dim * 2      # 512（attention_ctx + last_hidden）
+        enc_dim  = hidden_dim * 2
+        fuse_dim = enc_dim * 2
 
         self.attn = nn.Linear(enc_dim, 1)
 
@@ -147,16 +122,13 @@ class ClinicalFeatureClassifier(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, feat_dim)
         x = x.unsqueeze(-1)                                           # (B, F, 1)
         x = self.feat_proj(x)                                         # (B, F, 16)
         out, _ = self.lstm(x)                                         # (B, F, 256)
 
-        # Attention pooling
         weights  = torch.softmax(self.attn(out).squeeze(-1), dim=-1) # (B, F)
         attn_ctx = torch.bmm(weights.unsqueeze(1), out).squeeze(1)   # (B, 256)
 
-        # Last hidden state
         last_h = out[:, -1, :]                                        # (B, 256)
 
         fused = torch.cat([attn_ctx, last_h], dim=-1)                 # (B, 512)
@@ -166,7 +138,6 @@ class ClinicalFeatureClassifier(nn.Module):
 # ========================== FACTORY ========================================
 
 def create_vae(feat_dim=15, seq_len=None, cfg=None):
-    """LSTM Feature-VAE，seq_len 保留兼容旧签名，不使用。"""
     return ConditionalLSTMFeatureVAE(
         feat_dim   = feat_dim,
         hidden_dim = 64,
@@ -179,7 +150,6 @@ def create_vae(feat_dim=15, seq_len=None, cfg=None):
 
 
 def create_classifier(input_dim=15, cfg=None):
-    """BiLSTM + Attention 分类器。"""
     return ClinicalFeatureClassifier(
         input_dim  = input_dim,
         hidden_dim = 128,
@@ -188,12 +158,9 @@ def create_classifier(input_dim=15, cfg=None):
     )
 
 
-# ========================== TEST ===========================================
-
 if __name__ == "__main__":
     B, F = 8, 10
 
-    # VAE test
     vae    = create_vae(F)
     x      = torch.randn(B, F)
     labels = torch.randint(0, 2, (B,))
@@ -209,7 +176,6 @@ if __name__ == "__main__":
     syn = vae.generate(1, num_samples=4)
     print(f"  Generate class-1: {syn.shape}")
 
-    # Classifier test
     clf = create_classifier(F)
     out = clf(torch.randn(B, F))
     print(f"\n[CLF]  BiLSTM input={x.shape} → output={out.shape}")

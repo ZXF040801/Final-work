@@ -5,8 +5,6 @@ from scipy.signal import butter, sosfiltfilt, find_peaks
 from scipy.interpolate import interp1d
 
 
-# ========================== CONFIGURATION ==================================
-
 class Config:
     DATA_DIR = "data"
     OUTPUT_DIR = "preprocessed"
@@ -17,12 +15,11 @@ class Config:
 
     WINDOW_SEC = 5.0
     OVERLAP = 0.90
-    WINDOW_LEN = int(WINDOW_SEC * FS)   # 300
-    STRIDE = int(WINDOW_LEN * (1 - OVERLAP))  # 75
+    WINDOW_LEN = int(WINDOW_SEC * FS)
+    STRIDE = int(WINDOW_LEN * (1 - OVERLAP))
 
     TARGET_SCORES = [0, 1]
 
-    # 6 VAE channels (back-tracked from top discriminative features)
     VAE_CHANNEL_NAMES = [
         'dist',       # ch0: finger distance
         's1_pitch',   # ch1: thumb pitch (rad, unwrapped)
@@ -33,7 +30,6 @@ class Config:
     ]
     N_VAE_CHANNELS = 6
 
-    # Channel indices within the 6-ch VAE window
     CH_DIST     = 0
     CH_S1_PITCH = 1
     CH_S1_ROLL  = 2
@@ -41,9 +37,7 @@ class Config:
     CH_S1_Z     = 4
     CH_S2_Y     = 5
 
-    # 15 clinical features — all extractable from 6 VAE channels
     CLINICAL_FEATURE_NAMES = [
-        # Tap rhythm on distance (4 features)
         'dist_iti_mean',         # 1  |d|=0.858  mean inter-tap interval
         'dist_tap_rate',         # 2  |d|=0.817  taps per second
         'dist_iti_cv',           # 3  rhythm stability (std/mean of ITI)
@@ -65,13 +59,7 @@ class Config:
     N_CLINICAL_FEATURES = 15
 
 
-# ========================== PARSING ========================================
-
 def parse_raw_file(filepath):
-    """
-    Parse raw .txt → per-sensor positions, orientations, timestamps.
-    Format: sensor_id  x  y  z  ori_a  ori_b  ori_c  timestamp_ms
-    """
     s1_pos, s2_pos = [], []
     s1_ori, s2_ori = [], []
     s1_ts, s2_ts = [], []
@@ -98,8 +86,6 @@ def parse_raw_file(filepath):
             np.array(s1_ts), np.array(s2_ts))
 
 
-# ========================== RESAMPLING =====================================
-
 def deduplicate_timestamps(data, timestamps):
     ts_unique, inverse = np.unique(timestamps, return_inverse=True)
     if len(ts_unique) == len(timestamps):
@@ -114,17 +100,10 @@ def deduplicate_timestamps(data, timestamps):
 
 
 def resample_and_build_6ch(s1_pos, s1_ori, s1_ts, s2_pos, s2_ori, s2_ts, fs):
-    """
-    Resample both sensors → build 6-channel VAE input.
-    Returns: (N, 6) array of [dist, s1_pitch, s1_roll, s1_x, s1_z, s2_y]
-             or None on failure.
-    """
-    # Deduplicate
     s1_pos, s1_ts_p = deduplicate_timestamps(s1_pos, s1_ts)
     s1_ori, s1_ts_o = deduplicate_timestamps(s1_ori, s1_ts)
     s2_pos, s2_ts_p = deduplicate_timestamps(s2_pos, s2_ts)
 
-    # Common time range
     t_start = max(s1_ts_p[0], s2_ts_p[0])
     t_end = min(s1_ts_p[-1], s2_ts_p[-1])
     if t_end <= t_start:
@@ -135,38 +114,30 @@ def resample_and_build_6ch(s1_pos, s1_ori, s1_ts, s2_pos, s2_ori, s2_ts, fs):
 
     N = len(t_uniform)
 
-    # Interpolate s1 position (x, y, z)
     s1_xyz = np.zeros((N, 3))
     for col in range(3):
         s1_xyz[:, col] = interp1d(s1_ts_p, s1_pos[:, col], kind='linear',
                                    fill_value='extrapolate')(t_uniform)
 
-    # Interpolate s2 position (x, y, z)
     s2_xyz = np.zeros((N, 3))
     for col in range(3):
         s2_xyz[:, col] = interp1d(s2_ts_p, s2_pos[:, col], kind='linear',
                                    fill_value='extrapolate')(t_uniform)
 
-    # ch0: dist = ||s1_pos - s2_pos||
     dist = np.sqrt(np.sum((s1_xyz - s2_xyz) ** 2, axis=1))
 
-    # ch1: s1_pitch — ori column 1, deg → rad → unwrap → interp
     s1_pitch_unwrap = np.unwrap(np.deg2rad(s1_ori[:, 1]))
     s1_pitch = interp1d(s1_ts_o, s1_pitch_unwrap, kind='linear',
                          fill_value='extrapolate')(t_uniform)
 
-    # ch2: s1_roll — ori column 0, deg → rad → unwrap → interp
     s1_roll_unwrap = np.unwrap(np.deg2rad(s1_ori[:, 0]))
     s1_roll = interp1d(s1_ts_o, s1_roll_unwrap, kind='linear',
                         fill_value='extrapolate')(t_uniform)
 
-    # ch3: s1_x
     s1_x = s1_xyz[:, 0]
 
-    # ch4: s1_z
     s1_z = s1_xyz[:, 2]
 
-    # ch5: s2_y
     s2_y = s2_xyz[:, 1]
 
     data = np.column_stack([dist, s1_pitch, s1_roll, s1_x, s1_z, s2_y])
@@ -194,10 +165,7 @@ def sliding_window(features, window_len, stride):
     return np.array(windows)
 
 
-# ========================== FEATURE HELPERS ================================
-
 def power_band_ratio(signal, fs, f_low, f_high):
-    """Power in [f_low, f_high) / total power. Zero-mean before FFT."""
     sig = signal - np.mean(signal)
     N = len(sig)
     if N < 4:
@@ -213,10 +181,6 @@ def power_band_ratio(signal, fs, f_low, f_high):
 
 
 def detect_taps_on_signal(signal, fs):
-    """
-    Detect tapping peaks using moving-average smoothing + find_peaks.
-    Returns: tap_times (sec), amps, ITI (sec). Empty arrays if <3 peaks.
-    """
     kernel = np.ones(5) / 5.0
     smoothed = np.convolve(signal, kernel, mode='same')
 
@@ -242,17 +206,7 @@ def detect_taps_on_signal(signal, fs):
     return tap_times, amps, ITI
 
 
-# ========================== 15 CLINICAL FEATURES ===========================
-
 def extract_window_features(window, fs=60):
-    """
-    Extract 15 clinical features from one window (T, 6).
-
-    Channel layout:
-        0: dist   1: s1_pitch   2: s1_roll   3: s1_x   4: s1_z   5: s2_y
-
-    Returns: (15,) float32
-    """
     C = Config
     dt = 1.0 / fs
     duration = len(window) * dt
@@ -263,7 +217,6 @@ def extract_window_features(window, fs=60):
     s1_x     = window[:, C.CH_S1_X]
     s2_y     = window[:, C.CH_S2_Y]
 
-    # ==== 1-4: Tap rhythm on distance ====
     tap_times, amps, ITI = detect_taps_on_signal(dist, fs)
 
     if len(ITI) > 0:
@@ -279,7 +232,6 @@ def extract_window_features(window, fs=60):
 
     dist_tap_rate = len(tap_times) / duration if len(tap_times) >= 3 else 0.0
 
-    # ==== 5-12: Frequency band power ratios ====
     s1_roll_pow_2_5  = power_band_ratio(s1_roll,  fs, 2, 5)
     dist_pow_0_2     = power_band_ratio(dist,     fs, 0, 2)
     dist_pow_2_5     = power_band_ratio(dist,     fs, 2, 5)
@@ -289,7 +241,6 @@ def extract_window_features(window, fs=60):
     s2_y_pow_0_2     = power_band_ratio(s2_y,     fs, 0, 2)
     s1_pitch_pow_0_2 = power_band_ratio(s1_pitch, fs, 0, 2)
 
-    # ==== 13-15: s1_pitch velocity features ====
     vel = np.diff(s1_pitch) / dt
     s1_pitch_vel_rms = np.sqrt(np.mean(vel ** 2))
     s1_pitch_vel_std = np.std(vel)
@@ -315,23 +266,12 @@ def extract_window_features(window, fs=60):
 
 
 def extract_features_batch(windows, dt=1.0/60):
-    """(N, T, 6) → (N, 15)"""
     fs = 1.0 / dt
     features = np.array([extract_window_features(w, fs) for w in windows])
     return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# ========================== FOLDER-BASED LOADING ===========================
-
 def load_file_list_from_folders(data_dir, target_scores):
-    """
-    Load file list from folder structure:
-        data_dir/0/*.txt   → UPDRS score 0 (Non-PD)
-        data_dir/1/*.txt   → UPDRS score 1 (PD)
-
-    Patient ID extracted from filename:
-        PD-Ruijin_<PatientID>_tapping<hand>_<date>.txt
-    """
     records = []
     for score in target_scores:
         folder = os.path.join(data_dir, str(score))
@@ -341,14 +281,11 @@ def load_file_list_from_folders(data_dir, target_scores):
         for fname in sorted(os.listdir(folder)):
             if not fname.endswith('.txt'):
                 continue
-            # Extract patient ID from filename
             parts = fname.replace('.txt', '').split('_')
             if len(parts) >= 2:
                 patient_id = parts[1]
             else:
                 patient_id = fname
-
-            # Extract hand from filename
             fn_lower = fname.lower()
             hand = 'left' if 'left' in fn_lower else (
                    'right' if 'right' in fn_lower else 'unknown')
@@ -363,10 +300,7 @@ def load_file_list_from_folders(data_dir, target_scores):
     return records
 
 
-# ========================== NORMALISATION ==================================
-
 def compute_normalization_stats(X):
-    """Compute per-channel mean/std from (N, T, C) array."""
     flat = X.reshape(-1, X.shape[-1])
     mean = flat.mean(axis=0)
     std = flat.std(axis=0)
@@ -377,44 +311,28 @@ def compute_normalization_stats(X):
 def normalize(X, mean, std):
     return (X - mean) / std
 
-
-# ========================== PROCESS ONE FILE ===============================
-
 def process_single_file(filepath, cfg):
-    """
-    Process one recording.
-    Returns:
-        windows_vae:  (M, 300, 6)  — 6-channel for VAE
-        windows_feat: (M, 15)      — clinical features for classifier
-    """
     s1_pos, s2_pos, s1_ori, s2_ori, s1_ts, s2_ts = parse_raw_file(filepath)
     if len(s1_pos) < 10 or len(s2_pos) < 10:
         return None, None
-
-    # Resample → 6-channel: [dist, s1_pitch, s1_roll, s1_x, s1_z, s2_y]
     data = resample_and_build_6ch(s1_pos, s1_ori, s1_ts,
                                    s2_pos, s2_ori, s2_ts, cfg.FS)
     if data is None:
         return None, None
 
-    # Lowpass filter on position-based channels
-    # ch0=dist, ch3=s1_x, ch4=s1_z, ch5=s2_y (NOT orientation channels)
     for col in [0, 3, 4, 5]:
         data[:, col] = lowpass_filter(data[:, col], cfg.LOWPASS_CUTOFF,
                                        cfg.FS, cfg.LOWPASS_ORDER)
 
-    # Sliding window → (M, 300, 6)
     windows = sliding_window(data, cfg.WINDOW_LEN, cfg.STRIDE)
     if len(windows) == 0:
         return None, None
 
-    # Extract 15 clinical features from each 6-ch window
     feats = extract_features_batch(windows, dt=1.0 / cfg.FS)
 
     return windows, feats
 
 
-# ========================== MAIN PIPELINE ==================================
 
 def preprocess_dataset(cfg):
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
@@ -478,8 +396,6 @@ def preprocess_dataset(cfg):
     print(f"  Saved to: {output_path}")
     return X_raw, X_feat, y, patient_ids, file_ids, metadata
 
-
-# ========================== PATIENT-AWARE SPLIT ============================
 
 def patient_aware_split(X_raw, X_feat, y, patient_ids, file_ids=None,
                         test_ratio=0.2, seed=42):

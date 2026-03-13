@@ -20,8 +20,6 @@ def load_results():
         return pickle.load(f)
 
 
-# ========================== CLASSIFICATION =================================
-
 def evaluate_model(clf, X_feat_te, y_te, device):
     clf.eval()
     with torch.no_grad():
@@ -43,19 +41,31 @@ def print_results(X_feat_te, y_te, feat_dim, device):
     auc_score   = auc(fpr, tpr)
     acc         = (preds_aug == y_te).mean()
 
+    tp = int(((preds_aug == 1) & (y_te == 1)).sum())
+    tn = int(((preds_aug == 0) & (y_te == 0)).sum())
+    fp = int(((preds_aug == 1) & (y_te == 0)).sum())
+    fn = int(((preds_aug == 0) & (y_te == 1)).sum())
+
+    sensitivity = tp / (tp + fn + 1e-8)
+    specificity = tn / (tn + fp + 1e-8)
+    mcc_denom   = ((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn)) ** 0.5
+    mcc         = (tp*tn - fp*fn) / (mcc_denom + 1e-8)
+
     print("\n" + "=" * 60)
     print("AFTER VAE (Real + Synthetic Data)")
     print("=" * 60)
     print(classification_report(y_te, preds_aug,
           target_names=['Non-PD (0)', 'PD (1)'], digits=3))
-    print(f"  AUC:      {auc_score:.3f}")
-    print(f"  Accuracy: {acc:.3f}")
+    print(f"  AUC:         {auc_score:.3f}")
+    print(f"  Accuracy:    {acc:.3f}")
+    print(f"  Sensitivity: {sensitivity:.3f} ")
+    print(f"  Specificity: {specificity:.3f} ")
+    print(f"  MCC:         {mcc:.3f}")
     print("=" * 60)
 
     return preds_aug, probs_aug
 
 
-# ========================== PLOTS ==========================================
 
 def plot_confusion(y_te, preds_aug):
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -113,11 +123,9 @@ def plot_training_curves(vae_hist, clf_hists):
 
 
 def plot_tsne(vae, X_feat_tr, y_tr, syn_feat, syn_y, device):
-    """t-SNE 可视化 LSTM Feature-VAE 的隐空间分布"""
     print("  Computing t-SNE...")
     vae.eval()
 
-    # 编码真实特征
     z_list = []
     for i in range(0, len(X_feat_tr), 64):
         xb = torch.FloatTensor(X_feat_tr[i:i+64]).to(device)
@@ -127,7 +135,6 @@ def plot_tsne(vae, X_feat_tr, y_tr, syn_feat, syn_y, device):
         z_list.append(z.cpu().numpy())
     z_real = np.concatenate(z_list)
 
-    # 编码合成特征
     z_syn = np.empty((0, z_real.shape[1]))
     if len(syn_y) > 0 and syn_feat.ndim == 2 and len(syn_feat) > 0:
         zs = []
@@ -167,10 +174,6 @@ def plot_tsne(vae, X_feat_tr, y_tr, syn_feat, syn_y, device):
 
 
 def plot_reconstruction(vae, X_feat_te, y_te, feat_names, device, n=4):
-    """
-    Feature-VAE 重建质量可视化：
-    条形图对比每个样本的原始特征值 vs 重建特征值。
-    """
     vae.eval()
     np.random.seed(42)
     idx0 = np.where(y_te == 0)[0]
@@ -218,8 +221,6 @@ def plot_reconstruction(vae, X_feat_te, y_te, feat_names, device, n=4):
     print(f"  Saved: {path}")
 
 
-# ========================== MAIN ===========================================
-
 def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -235,7 +236,6 @@ def main():
           f"(0={np.sum(res['y_test']==0)}, 1={np.sum(res['y_test']==1)})")
     print(f"  LSTM Feature-VAE: {feat_dim}-dim input/output")
 
-    # 加载 LSTM Feature-VAE
     vae = create_vae(feat_dim).to(device)
     vae.load_state_dict(torch.load(
         os.path.join(CKPT_DIR, 'vae_best.pt'),

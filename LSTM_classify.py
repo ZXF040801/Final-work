@@ -1,245 +1,252 @@
+import os, pickle, time
+import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from collections import Counter
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    roc_curve, auc, ConfusionMatrixDisplay,
+)
+from preprocessing import patient_aware_split, compute_normalization_stats, normalize
+
+SEED        = 42
+DATA_PATH   = 'preprocessed/preprocessed_data.pkl'
+CKPT_DIR    = 'checkpoints'
+RESULTS_DIR = 'results'
+DEVICE      = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+HIDDEN_DIM  = 64
+NUM_LAYERS  = 2
+DROPOUT     = 0.4
+
+EPOCHS        = 500
+BATCH         = 32
+LR            = 1e-3
+WD            = 1e-2
+LABEL_SMOOTH  = 0.1
+PATIENCE      = 9999
 
 
-# ========================== LSTM FEATURE VAE ================================
-# VAE Encoder/Decoder 均使用 LSTM，把 feat_dim 个特征当作序列处理
-
-class ConditionalLSTMFeatureVAE(nn.Module):
-    """
-    Conditional LSTM-VAE，直接在归一化临床特征空间操作。
-
-    把 (B, feat_dim) 的特征向量视为 feat_dim 个时间步 × 1 维的序列：
-      (B, feat_dim) → (B, feat_dim, 1)
-
-    Encoder: BiLSTM + Attention Pooling → mu / logvar
-    Decoder: LSTM（隐态由 latent 初始化）→ (B, feat_dim, hidden) → FC → (B, feat_dim)
-    """
-    def __init__(self, feat_dim=15, hidden_dim=64, latent_dim=16,
-                 num_layers=2, n_classes=2, embed_dim=8, dropout=0.2):
+class LabelSmoothingBCELoss(nn.Module):
+    def __init__(self, s=0.1):
         super().__init__()
-        self.feat_dim   = feat_dim
-        self.hidden_dim = hidden_dim
-        self.latent_dim = latent_dim
-        self.num_layers = num_layers
+        self.s = s
 
-        self.class_embed = nn.Embedding(n_classes, embed_dim)
+    def forward(self, logits, targets):
+        targets = targets.float() * (1 - self.s) + 0.5 * self.s
+        return nn.functional.binary_cross_entropy_with_logits(logits, targets)
 
-        # ── Encoder: BiLSTM ──────────────────────────────────────────────
-        # 输入每个时间步: 1(特征值) + embed_dim(类别)
-        self.encoder = nn.LSTM(
-            input_size    = 1 + embed_dim,
-            hidden_size   = hidden_dim,
-            num_layers    = num_layers,
-            batch_first   = True,
-            dropout       = dropout if num_layers > 1 else 0.0,
-            bidirectional = True,
-        )
-        enc_out_dim = hidden_dim * 2  # 双向
+class LSTMClassifier(nn.Module):
 
-        # Attention pooling
-        self.attn_w = nn.Linear(enc_out_dim, 1)
-
-        self.fc_mu     = nn.Linear(enc_out_dim, latent_dim)
-        self.fc_logvar = nn.Linear(enc_out_dim, latent_dim)
-
-        # ── Decoder: 单向 LSTM ───────────────────────────────────────────
-        # 每个时间步输入: latent + embed
-        self.latent_to_h = nn.Linear(latent_dim + embed_dim,
-                                     hidden_dim * num_layers)
-        self.latent_to_c = nn.Linear(latent_dim + embed_dim,
-                                     hidden_dim * num_layers)
-
-        self.decoder = nn.LSTM(
-            input_size  = latent_dim + embed_dim,
-            hidden_size = hidden_dim,
-            num_layers  = num_layers,
-            batch_first = True,
-            dropout     = dropout if num_layers > 1 else 0.0,
-        )
-
-        self.fc_out = nn.Linear(hidden_dim, 1)   # 每个时间步输出 1 个标量
-
-    def _attn_pool(self, enc_out):
-        """enc_out: (B, T, enc_out_dim) → (B, enc_out_dim)"""
-        scores  = self.attn_w(enc_out).squeeze(-1)       # (B, T)
-        weights = torch.softmax(scores, dim=-1)           # (B, T)
-        return torch.bmm(weights.unsqueeze(1), enc_out).squeeze(1)
-
-    def encode(self, x, labels):
-        """x: (B, feat_dim), labels: (B,) → z, mu, logvar"""
-        B, F = x.shape
-        emb     = self.class_embed(labels)                # (B, embed_dim)
-        emb_rep = emb.unsqueeze(1).expand(-1, F, -1)     # (B, F, embed_dim)
-        x_seq   = x.unsqueeze(-1)                        # (B, F, 1)
-        inp     = torch.cat([x_seq, emb_rep], dim=-1)    # (B, F, 1+embed)
-
-        enc_out, _ = self.encoder(inp)                   # (B, F, hidden*2)
-        ctx = self._attn_pool(enc_out)                   # (B, hidden*2)
-
-        mu     = self.fc_mu(ctx)
-        logvar = self.fc_logvar(ctx)
-        std    = torch.exp(0.5 * logvar)
-        z      = mu + std * torch.randn_like(std)
-        return z, mu, logvar
-
-    def decode(self, z, labels):
-        """z: (B, latent_dim), labels: (B,) → recon: (B, feat_dim)"""
-        B      = z.size(0)
-        emb    = self.class_embed(labels)                # (B, embed_dim)
-        z_cond = torch.cat([z, emb], dim=-1)             # (B, latent+embed)
-
-        # 用 latent 初始化 hidden state
-        h0 = self.latent_to_h(z_cond) \
-                 .view(B, self.num_layers, self.hidden_dim) \
-                 .permute(1, 0, 2).contiguous()
-        c0 = self.latent_to_c(z_cond) \
-                 .view(B, self.num_layers, self.hidden_dim) \
-                 .permute(1, 0, 2).contiguous()
-
-        # 每个时间步都输入同一个 z_cond
-        z_rep   = z_cond.unsqueeze(1).expand(-1, self.feat_dim, -1)  # (B, F, latent+embed)
-        dec_out, _ = self.decoder(z_rep, (h0, c0))      # (B, F, hidden)
-        out = self.fc_out(dec_out).squeeze(-1)           # (B, F)
-        return out
-
-    def forward(self, x, labels):
-        z, mu, logvar = self.encode(x, labels)
-        recon = self.decode(z, labels)
-        return recon, mu, logvar
-
-    def generate(self, class_label, num_samples=1, device='cpu'):
-        """采样 z ~ N(0,I)，生成归一化特征向量 (num_samples, feat_dim)"""
-        self.eval()
-        with torch.no_grad():
-            z      = torch.randn(num_samples, self.latent_dim).to(device)
-            labels = torch.full((num_samples,), class_label,
-                                dtype=torch.long).to(device)
-            return self.decode(z, labels)
-
-
-def vae_loss_fn(recon, target, mu, logvar, kl_weight=0.001, free_bits=0.1):
-    """MSE 重建损失 + KL（带 free bits）"""
-    recon_loss = nn.functional.mse_loss(recon, target, reduction='mean')
-    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-    kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
-    kl_loss    = kl_per_dim.sum(dim=-1).mean()
-    total      = recon_loss + kl_weight * kl_loss
-    return total, recon_loss, kl_loss
-
-
-# ========================== LSTM CLASSIFIER ================================
-# 分类器部分与原 model_LSTM.py 完全相同：BiLSTM + Attention
-
-class ClinicalFeatureClassifier(nn.Module):
-    """
-    BiLSTM + Attention classifier on clinical features.
-
-    Pipeline:
-      (B, feat_dim) → unsqueeze → (B, feat_dim, 1)
-                    → feat_proj(16) → (B, feat_dim, 16)
-                    → BiLSTM(128)   → (B, feat_dim, 256)
-                    → attention + last_hidden → concat(512)
-                    → BN → FC(256) → FC(64) → FC(1)
-    """
-    def __init__(self, input_dim=15, hidden_dim=128, num_layers=2, dropout=0.4):
+    def __init__(self, input_dim=1):
         super().__init__()
-        self.feat_proj = nn.Sequential(
-            nn.Linear(1, 16),
-            nn.ReLU(),
-        )
-
         self.lstm = nn.LSTM(
-            input_size    = 16,
-            hidden_size   = hidden_dim,
-            num_layers    = num_layers,
+            input_size    = input_dim,
+            hidden_size   = HIDDEN_DIM,
+            num_layers    = NUM_LAYERS,
             batch_first   = True,
-            dropout       = dropout if num_layers > 1 else 0.0,
+            dropout       = DROPOUT if NUM_LAYERS > 1 else 0.0,
             bidirectional = True,
         )
-        enc_dim  = hidden_dim * 2   # 256
-        fuse_dim = enc_dim * 2      # 512（attention_ctx + last_hidden）
-
-        self.attn = nn.Linear(enc_dim, 1)
+        enc_dim = HIDDEN_DIM * 2   # 128
 
         self.head = nn.Sequential(
-            nn.BatchNorm1d(fuse_dim),
-            nn.Linear(fuse_dim, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(enc_dim, 32),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1),
+            nn.Dropout(DROPOUT),
+            nn.Linear(32, 1),
         )
 
     def forward(self, x):
-        # x: (B, feat_dim)
-        x = x.unsqueeze(-1)                                           # (B, F, 1)
-        x = self.feat_proj(x)                                         # (B, F, 16)
-        out, _ = self.lstm(x)                                         # (B, F, 256)
-
-        # Attention pooling
-        weights  = torch.softmax(self.attn(out).squeeze(-1), dim=-1) # (B, F)
-        attn_ctx = torch.bmm(weights.unsqueeze(1), out).squeeze(1)   # (B, 256)
-
-        # Last hidden state
-        last_h = out[:, -1, :]                                        # (B, 256)
-
-        fused = torch.cat([attn_ctx, last_h], dim=-1)                 # (B, 512)
-        return self.head(fused).squeeze(-1)                           # (B,)
+        if x.dim() == 2:
+            x = x.unsqueeze(-1)
+        out, _ = self.lstm(x)
+        last   = out[:, -1, :]
+        return self.head(last).squeeze(-1)
 
 
-# ========================== FACTORY ========================================
+def main():
+    np.random.seed(SEED); torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
-def create_vae(feat_dim=15, seq_len=None, cfg=None):
-    """LSTM Feature-VAE，seq_len 保留兼容旧签名，不使用。"""
-    return ConditionalLSTMFeatureVAE(
-        feat_dim   = feat_dim,
-        hidden_dim = 64,
-        latent_dim = 16,
-        num_layers = 2,
-        n_classes  = 2,
-        embed_dim  = 8,
-        dropout    = 0.2,
-    )
+    with open(DATA_PATH, 'rb') as f:
+        data = pickle.load(f)
+    X_raw  = data['X_raw']
+    y      = data['y']
+    pids   = data['patient_ids']
+    fids   = data.get('file_ids', None)
+    X_feat = data['X_feat']
 
+    print(f"[Load] X_raw={X_raw.shape}, y: {dict(Counter(y))}, "
+          f"patients={len(set(pids))}")
+    split = patient_aware_split(X_raw, X_feat, y, pids, fids)
+    print(f"[Split] Train: {len(split['y_tr'])} ({dict(Counter(split['y_tr']))})")
+    print(f"[Split] Test:  {len(split['y_te'])} ({dict(Counter(split['y_te']))})")
 
-def create_classifier(input_dim=15, cfg=None):
-    """BiLSTM + Attention 分类器。"""
-    return ClinicalFeatureClassifier(
-        input_dim  = input_dim,
-        hidden_dim = 128,
-        num_layers = 2,
-        dropout    = 0.4,
-    )
+    feat_mean = split['X_feat_tr'].mean(axis=0)
+    feat_std  = split['X_feat_tr'].std(axis=0)
+    feat_std[feat_std < 1e-8] = 1.0
+    X_tr = (split['X_feat_tr'] - feat_mean) / feat_std  # (N, 15)
+    X_te = (split['X_feat_te'] - feat_mean) / feat_std
+    y_tr, y_te = split['y_tr'], split['y_te']
 
+    X_tr_dev = torch.FloatTensor(X_tr).to(DEVICE)
+    y_tr_dev = torch.FloatTensor(y_tr).to(DEVICE)
+    X_te_dev = torch.FloatTensor(X_te).to(DEVICE)
+    y_te_dev = torch.FloatTensor(y_te).to(DEVICE)
 
-# ========================== TEST ===========================================
+    train_dl = DataLoader(
+        TensorDataset(X_tr_dev, y_tr_dev),
+        batch_size=BATCH, shuffle=True)
+    test_dl = DataLoader(
+        TensorDataset(X_te_dev, y_te_dev),
+        batch_size=BATCH)
+
+    model = LSTMClassifier(input_dim=1).to(DEVICE)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\n[Model] BiLSTM | hidden={HIDDEN_DIM}x{NUM_LAYERS} "
+          f"| params={n_params:,} | device={DEVICE}")
+
+    criterion = LabelSmoothingBCELoss(LABEL_SMOOTH)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS)
+
+    print(f"\n{'='*60}")
+    print(f"TRAINING LSTM Classifier")
+    print(f"  epochs={EPOCHS} | batch={BATCH} | lr={LR} | wd={WD}")
+    print(f"  label_smooth={LABEL_SMOOTH} | patience={PATIENCE}")
+    print("  Input: 15 clinical features (same as train.py classifier)")
+    print("  (params aligned with train.py for fair comparison)")
+    print(f"{'='*60}")
+
+    history  = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'val_f1': []}
+    best_f1  = 0.0
+    patience = 0
+    ckpt     = os.path.join(CKPT_DIR, 'lstm_best.pt')
+
+    for epoch in range(EPOCHS):
+        t0 = time.time()
+
+        model.train()
+        tr_loss, n = 0.0, 0
+        for xb, yb in train_dl:
+            loss = criterion(model(xb), yb)
+            optimizer.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            tr_loss += loss.item() * len(yb); n += len(yb)
+        scheduler.step()
+
+        model.eval()
+        probs_list, true_list, vl, vn = [], [], 0.0, 0
+        with torch.no_grad():
+            for xb, yb in test_dl:
+                logits = model(xb)
+                vl  += criterion(logits, yb).item() * len(yb); vn += len(yb)
+                probs_list.extend(torch.sigmoid(logits).cpu().tolist())
+                true_list.extend(yb.cpu().tolist())
+
+        probs = np.array(probs_list)
+        truth = np.array(true_list, dtype=int)
+        preds = (probs > 0.5).astype(int)
+        acc   = (preds == truth).mean()
+        tp = ((preds==1)&(truth==1)).sum()
+        fp = ((preds==1)&(truth==0)).sum()
+        fn = ((preds==0)&(truth==1)).sum()
+        prec = tp/(tp+fp+1e-8); rec = tp/(tp+fn+1e-8)
+        f1   = 2*prec*rec/(prec+rec+1e-8)
+
+        history['train_loss'].append(tr_loss/n)
+        history['val_loss'].append(vl/vn)
+        history['val_acc'].append(float(acc))
+        history['val_f1'].append(float(f1))
+
+        if f1 > best_f1:
+            best_f1 = f1; patience = 0
+            torch.save(model.state_dict(), ckpt)
+        else:
+            patience += 1
+            if patience >= PATIENCE:
+                print(f"  Early stop at epoch {epoch+1}"); break
+
+        if (epoch+1) % 20 == 0 or epoch == 0:
+            print(f"  Epoch {epoch+1:3d}/{EPOCHS} | Loss: {tr_loss/n:.4f} | "
+                  f"Acc: {acc:.3f} | F1: {f1:.3f} | "
+                  f"Rec(PD): {rec:.3f} | {time.time()-t0:.1f}s")
+
+    model.load_state_dict(torch.load(ckpt, map_location=DEVICE, weights_only=True))
+    model.eval()
+    probs_list, true_list = [], []
+    with torch.no_grad():
+        for xb, yb in test_dl:
+            probs_list.extend(torch.sigmoid(model(xb)).cpu().tolist())
+            true_list.extend(yb.cpu().tolist())
+
+    probs = np.array(probs_list)
+    truth = np.array(true_list, dtype=int)
+    preds = (probs > 0.5).astype(int)
+    fpr, tpr, _ = roc_curve(truth, probs)
+    auc_score   = auc(fpr, tpr)
+
+    tp = int(((preds == 1) & (truth == 1)).sum())
+    tn = int(((preds == 0) & (truth == 0)).sum())
+    fp = int(((preds == 1) & (truth == 0)).sum())
+    fn = int(((preds == 0) & (truth == 1)).sum())
+    sensitivity = tp / (tp + fn + 1e-8)
+    specificity = tn / (tn + fp + 1e-8)
+    mcc_denom   = ((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn)) ** 0.5
+    mcc         = (tp*tn - fp*fn) / (mcc_denom + 1e-8)
+
+    print(f"\n{'='*60}")
+    print(f"LSTM CLASSIFIER — Test Results")
+    print(f"{'='*60}")
+    print(classification_report(truth, preds,
+          target_names=['Non-PD (0)', 'PD (1)'], digits=3, zero_division=0))
+    print(f"  AUC:         {auc_score:.3f}")
+    print(f"  Sensitivity: {sensitivity:.3f}  ")
+    print(f"  Specificity: {specificity:.3f}  ")
+    print(f"  MCC:         {mcc:.3f}")
+    print(f"{'='*60}")
+
+    cm = confusion_matrix(truth, preds)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ConfusionMatrixDisplay(cm, display_labels=['Non-PD (0)', 'PD (1)']).plot(
+        ax=ax, cmap='Blues', values_format='d')
+    ax.set_title('LSTM Confusion Matrix')
+    fig.tight_layout()
+    p = os.path.join(RESULTS_DIR, 'lstm_confusion_matrix.png')
+    fig.savefig(p, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"  Saved: {p}")
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.plot(fpr, tpr, 'b-', lw=2, label=f'LSTM (AUC={auc_score:.3f})')
+    ax.plot([0,1],[0,1],'k--',alpha=0.5)
+    ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')
+    ax.set_title('ROC Curve — LSTM'); ax.legend(loc='lower right')
+    p = os.path.join(RESULTS_DIR, 'lstm_roc_curve.png')
+    fig.savefig(p, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"  Saved: {p}")
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.suptitle('LSTM Training History', fontsize=13)
+    axes[0].plot(history['train_loss'], label='Train')
+    axes[0].plot(history['val_loss'],   label='Val', ls='--')
+    axes[0].set_title('Loss'); axes[0].legend()
+    axes[1].plot(history['val_acc']); axes[1].set_title('Val Accuracy')
+    axes[2].plot(history['val_f1']);  axes[2].set_title('Val F1 (PD)')
+    for ax in axes: ax.set_xlabel('Epoch')
+    fig.tight_layout()
+    p = os.path.join(RESULTS_DIR, 'lstm_training_curves.png')
+    fig.savefig(p, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"  Saved: {p}")
 
 if __name__ == "__main__":
-    B, F = 8, 10
-
-    # VAE test (LSTM-VAE)
-    vae    = create_vae(F)
-    x      = torch.randn(B, F)
-    labels = torch.randint(0, 2, (B,))
-
-    recon, mu, lv = vae(x, labels)
-    print(f"[LSTM-VAE]  input={x.shape} → recon={recon.shape}")
-    print(f"            mu={mu.shape}, logvar={lv.shape}")
-    print(f"  Params: {sum(p.numel() for p in vae.parameters()):,}")
-
-    loss, rl, kl = vae_loss_fn(recon, x, mu, lv)
-    print(f"  Loss={loss.item():.4f}  Recon={rl.item():.4f}  KL={kl.item():.4f}")
-
-    syn = vae.generate(1, num_samples=4)
-    print(f"  Generate class-1: {syn.shape}")
-
-    # Classifier test
-    clf = create_classifier(F)
-    out = clf(torch.randn(B, F))
-    print(f"\n[CLF]  BiLSTM input={x.shape} → output={out.shape}")
-    print(f"  Params: {sum(p.numel() for p in clf.parameters()):,}")
+    main()
