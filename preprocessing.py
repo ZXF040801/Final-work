@@ -9,6 +9,7 @@ class Config:
     DATA_DIR = "data"
     OUTPUT_DIR = "preprocessed"
 
+
     FS = 60
     LOWPASS_CUTOFF = 20.0
     LOWPASS_ORDER = 4

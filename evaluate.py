@@ -15,6 +15,7 @@ RESULTS_DIR = 'results'
 CKPT_DIR    = 'checkpoints'
 
 
+
 def load_results():
     with open(os.path.join(CKPT_DIR, 'train_results.pkl'), 'rb') as f:
         return pickle.load(f)

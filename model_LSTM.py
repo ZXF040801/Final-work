@@ -3,6 +3,7 @@ import torch.nn as nn
 
 
 
+
 class ConditionalLSTMFeatureVAE(nn.Module):
     def __init__(self, feat_dim=15, hidden_dim=64, latent_dim=16,
                  num_layers=2, n_classes=2, embed_dim=8, dropout=0.2):

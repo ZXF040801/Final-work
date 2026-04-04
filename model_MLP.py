@@ -3,6 +3,7 @@ import torch.nn as nn
 
 
 
+
 class ConditionalMLPFeatureVAE(nn.Module):
     def __init__(self, feat_dim=15, hidden_dim=128, latent_dim=16,
                  n_classes=2, embed_dim=8, dropout=0.2):
